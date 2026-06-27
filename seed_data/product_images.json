@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "product_id": 1,
+    "image_url": "https://images.handloombazaar.in/products/saree1.jpg",
+    "display_id": "IMG-001",
+    "created_at": "2026-03-07T10:00:00",
+    "updated_at": "2026-03-07T10:00:00"
+  },
+  {
+    "id": 2,
+    "product_id": 2,
+    "image_url": "https://images.handloombazaar.in/products/saree2.jpg",
+    "display_id": "IMG-002",
+    "created_at": "2026-03-08T10:00:00",
+    "updated_at": "2026-03-08T10:00:00"
+  },
+  {
+    "id": 3,
+    "product_id": 3,
+    "image_url": "https://images.handloombazaar.in/products/saree3.jpg",
+    "display_id": "IMG-003",
+    "created_at": "2026-03-09T10:00:00",
+    "updated_at": "2026-03-09T10:00:00"
+  },
+  {
+    "id": 4,
+    "product_id": 4,
+    "image_url": "https://images.handloombazaar.in/products/saree4.jpg",
+    "display_id": "IMG-004",
+    "created_at": "2026-03-10T10:00:00",
+    "updated_at": "2026-03-10T10:00:00"
+  },
+  {
+    "id": 5,
+    "product_id": 5,
+    "image_url": "https://images.handloombazaar.in/products/saree5.jpg",
+    "display_id": "IMG-005",
+    "created_at": "2026-03-11T10:00:00",
+    "updated_at": "2026-03-11T10:00:00"
+  }
+]

@@ -1,11 +1,24 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import uvicorn
 import os
 
+from db.database import db
+from api.products import products_router
+from api.create import create_router
 
-app = FastAPI(title="HandloomBazaar API", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.connect()
+    try:
+        yield
+    finally:
+        db.disconnect()
+
+
+app = FastAPI(title="HandloomBazaar API", version="0.1.0", lifespan=lifespan)
 
 # Configure CORS origins via environment variable `CORS_ORIGINS`
 # Default allows Next.js dev server origins
@@ -21,17 +34,25 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def ensure_db_connection(request: Request, call_next):
+    if request.url.path != "/health":
+        try:
+            db.ensure_connection()
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": f"Database unavailable: {exc}"},
+            )
+    return await call_next(request)
+
+
+app.include_router(products_router)
+app.include_router(create_router)
+
 @app.get("/health")
 async def health():
     return JSONResponse({"status": "ok"})
-
-
-# Placeholder: include routers when implemented. Example:
-# try:
-#     from routers.retailers import router as retailers_router
-#     app.include_router(retailers_router, prefix="/api/retailers")
-# except Exception:
-#     pass
 
 
 if __name__ == "__main__":

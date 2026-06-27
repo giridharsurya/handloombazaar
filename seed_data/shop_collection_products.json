@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "shop_collection_id": 1,
+    "collection_product_id": 1,
+    "display_id": 3001,
+    "created_at": "2026-03-02T10:00:00",
+    "updated_at": "2026-03-02T10:00:00"
+  },
+  {
+    "id": 2,
+    "shop_collection_id": 2,
+    "collection_product_id": 2,
+    "display_id": 3002,
+    "created_at": "2026-03-03T10:00:00",
+    "updated_at": "2026-03-03T10:00:00"
+  },
+  {
+    "id": 3,
+    "shop_collection_id": 3,
+    "collection_product_id": 3,
+    "display_id": 3003,
+    "created_at": "2026-03-04T10:00:00",
+    "updated_at": "2026-03-04T10:00:00"
+  },
+  {
+    "id": 4,
+    "shop_collection_id": 4,
+    "collection_product_id": 4,
+    "display_id": 3004,
+    "created_at": "2026-03-05T10:00:00",
+    "updated_at": "2026-03-05T10:00:00"
+  },
+  {
+    "id": 5,
+    "shop_collection_id": 5,
+    "collection_product_id": 5,
+    "display_id": 3005,
+    "created_at": "2026-03-06T10:00:00",
+    "updated_at": "2026-03-06T10:00:00"
+  }
+]

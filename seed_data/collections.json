@@ -1,0 +1,52 @@
+[
+  {
+    "id": 1,
+    "shop_id": 1,
+    "name": "Bridal Sarees",
+    "description": "Premium bridal saree curation.",
+    "created_at": "2026-02-10T10:00:00",
+    "updated_at": "2026-02-10T10:00:00",
+    "is_active": true,
+    "display_id": "COL-001"
+  },
+  {
+    "id": 2,
+    "shop_id": 2,
+    "name": "Wedding Classics",
+    "description": "Timeless handloom wedding sarees.",
+    "created_at": "2026-02-11T10:00:00",
+    "updated_at": "2026-02-11T10:00:00",
+    "is_active": true,
+    "display_id": "COL-002"
+  },
+  {
+    "id": 3,
+    "shop_id": 3,
+    "name": "Festive Picks",
+    "description": "Vibrant sarees for festive occasions.",
+    "created_at": "2026-02-12T10:00:00",
+    "updated_at": "2026-02-12T10:00:00",
+    "is_active": true,
+    "display_id": "COL-003"
+  },
+  {
+    "id": 4,
+    "shop_id": 4,
+    "name": "Lightweight Elegance",
+    "description": "Comfort-first sarees for day events.",
+    "created_at": "2026-02-13T10:00:00",
+    "updated_at": "2026-02-13T10:00:00",
+    "is_active": true,
+    "display_id": "COL-004"
+  },
+  {
+    "id": 5,
+    "shop_id": 5,
+    "name": "Daily Luxury",
+    "description": "Everyday wear with artisanal detailing.",
+    "created_at": "2026-02-14T10:00:00",
+    "updated_at": "2026-02-14T10:00:00",
+    "is_active": true,
+    "display_id": "COL-005"
+  }
+]

@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "attribute_definition_id": 1,
+    "option_value": "Ruby Red",
+    "display_id": "AO-001",
+    "created_at": "2026-03-17T10:00:00",
+    "updated_at": "2026-03-17T10:00:00"
+  },
+  {
+    "id": 2,
+    "attribute_definition_id": 2,
+    "option_value": "Pure Silk",
+    "display_id": "AO-002",
+    "created_at": "2026-03-18T10:00:00",
+    "updated_at": "2026-03-18T10:00:00"
+  },
+  {
+    "id": 3,
+    "attribute_definition_id": 3,
+    "option_value": "Ikat",
+    "display_id": "AO-003",
+    "created_at": "2026-03-19T10:00:00",
+    "updated_at": "2026-03-19T10:00:00"
+  },
+  {
+    "id": 4,
+    "attribute_definition_id": 4,
+    "option_value": "Festive",
+    "display_id": "AO-004",
+    "created_at": "2026-03-20T10:00:00",
+    "updated_at": "2026-03-20T10:00:00"
+  },
+  {
+    "id": 5,
+    "attribute_definition_id": 5,
+    "option_value": "Kanchipuram",
+    "display_id": "AO-005",
+    "created_at": "2026-03-21T10:00:00",
+    "updated_at": "2026-03-21T10:00:00"
+  }
+]
