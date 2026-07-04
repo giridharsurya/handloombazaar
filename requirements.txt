@@ -3,3 +3,6 @@ uvicorn
 python-dotenv
 sqlalchemy
 pyodbc
+PyJWT
+bcrypt
+email-validator

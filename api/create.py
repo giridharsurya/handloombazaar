@@ -51,6 +51,11 @@ def create_product(engine = Depends(get_engine)):
     Base.metadata.create_all(bind=engine)
     return {"message": "Database tables created successfully."}
 
+@create_router.post("/delete")
+def create_product(engine = Depends(get_engine)):
+    # Create the database tables if they don't exist
+    Base.metadata.drop_all(bind=engine)
+    return {"message": "Database tables deleted successfully."}
 
 @create_router.post("/seed")
 def seed_database(
