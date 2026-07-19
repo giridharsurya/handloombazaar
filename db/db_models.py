@@ -119,6 +119,27 @@ class collection_product(Base):
     updated_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+
+class collection_shop(Base):
+    __tablename__ = "collection_shops"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    collection_id: Mapped[int] = mapped_column(Integer, ForeignKey("collections.id", ondelete='CASCADE'), nullable=False)
+    shop_id: Mapped[int] = mapped_column(Integer, ForeignKey("shops.id", ondelete='CASCADE'), nullable=False)
+    # optional store of shop display id for easier lookups
+    shop_display_id: Mapped[str] = mapped_column(String(8), nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+
+
+class collection_attribute_option(Base):
+    __tablename__ = "collection_attribute_options"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    collection_id: Mapped[int] = mapped_column(Integer, ForeignKey("collections.id", ondelete='CASCADE'), nullable=False)
+    attribute_definition_id: Mapped[int] = mapped_column(Integer, ForeignKey("attribute_definitions.id", ondelete='CASCADE'), nullable=False)
+    attribute_option_id: Mapped[int] = mapped_column(Integer, ForeignKey("attribute_options.id", ondelete='CASCADE'), nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+
 class shop_collection(Base):
     __tablename__ = "shop_collections"
 

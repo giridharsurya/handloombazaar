@@ -12,6 +12,7 @@ from api.create import create_router
 from api.admin import admin_router
 from api.auth import auth_router
 from api.shops import shops_router
+from api.collections import router as collections_router
 from fastapi import Request
 from utils.auth import verify_token
 from db.db_models import user as UserModel, shop as ShopModel
@@ -97,6 +98,7 @@ app.include_router(create_router)
 app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(shops_router)
+app.include_router(collections_router)
 
 @app.get("/health")
 async def health():

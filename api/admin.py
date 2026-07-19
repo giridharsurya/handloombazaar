@@ -71,6 +71,7 @@ def get_shops(session: Session = Depends(get_session)):
         "items": [
             {
                 "id": row.id,
+                "display_id": row.display_id,
                 "name": row.name,
                 "email": row.email,
                 "is_active": row.is_active,
@@ -93,6 +94,7 @@ def get_pending_shops(session: Session = Depends(get_session)):
         "items": [
             {
                 "id": row.id,
+                "display_id": row.display_id,
                 "name": row.name,
                 "email": row.email,
                 "created_at": row.created_at,
@@ -465,10 +467,19 @@ def delete_attribute(attribute_id: int, session: Session = Depends(get_session))
     if selected_attribute is None:
         raise HTTPException(status_code=404, detail="Attribute not found")
 
-    # Database CASCADE will automatically delete:
-    # - attribute_options (via FK constraint)
-    # - product_attributes (via FK constraint)
-    session.delete(selected_attribute)
-    session.commit()
+    # Explicitly delete related attribute options to be safe
+    try:
+        session.query(attribute_option).filter(attribute_option.attribute_definition_id == attribute_id).delete()
+    except Exception:
+        session.rollback()
+        raise HTTPException(status_code=500, detail="Failed to delete attribute options")
 
-    return {"message": "Attribute and all associated data deleted successfully"}
+    # Now delete the attribute definition
+    try:
+        session.delete(selected_attribute)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise HTTPException(status_code=500, detail="Failed to delete attribute definition")
+
+    return {"message": "Attribute and all associated options deleted successfully"}
