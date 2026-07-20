@@ -64,8 +64,10 @@ def list_collections(kind: Optional[str] = None, shop_display_id: Optional[str] 
     items = []
 
     if k == "system":
-        # list system collections from `collection` table; include any constraint shop display ids
-        rows = session.query(collection).order_by(collection.created_at.desc()).all()
+        # system collections = entries in `collection` that do NOT have a shop binding
+        # i.e., skip any collection that has a shop_collection referencing it
+        subq = session.query(shop_collection.collection_id).distinct()
+        rows = session.query(collection).filter(~collection.id.in_(subq)).order_by(collection.created_at.desc()).all()
         for r in rows:
             item = {"id": r.id, "display_id": r.display_id, "name": r.name, "description": r.description, "is_active": r.is_active}
             # include linked constraint shops (collection_shops) when present
@@ -80,24 +82,34 @@ def list_collections(kind: Optional[str] = None, shop_display_id: Optional[str] 
     # list shop collections from `shop_collections`. If `shop_display_id` provided, filter by that shop.
     from db.db_models import shop as shop_model
 
-    sc_q = session.query(shop_collection).order_by(shop_collection.created_at.desc())
+    # k == 'shop'
+    # If a shop_display_id is provided, fetch collection_ids from shop_collections for that shop
+    # and return the authoritative collection rows. If no shop_display_id provided, return
+    # all shop-scoped collections (collections that have a shop_collection row), joining to
+    # collection metadata when available.
     if shop_display_id:
-        sc_q = sc_q.join(shop_model, shop_collection.shop_id == shop_model.id).filter(shop_model.display_id == shop_display_id)
+        # find the shop id for the display id
+        shop_row = session.query(shop_model).filter(shop_model.display_id == shop_display_id).first()
+        if not shop_row:
+            return {"items": []}
+        col_ids = [r.collection_id for r in session.query(shop_collection.collection_id).filter(shop_collection.shop_id == shop_row.id).all()]
+        if not col_ids:
+            return {"items": []}
+        rows = session.query(collection).filter(collection.id.in_(col_ids)).order_by(collection.created_at.desc()).all()
+        for r in rows:
+            item = {"id": r.id, "display_id": r.display_id, "name": r.name, "description": r.description, "is_active": r.is_active}
+            items.append(item)
+        return {"items": items}
 
-    sc_rows = sc_q.all()
-    for sc in sc_rows:
-        # if shop_collection links to a system collection, include its metadata
-        linked = None
-        if sc.collection_id:
-            linked = session.query(collection).filter(collection.id == sc.collection_id).first()
-        item = {
-            "id": sc.id,
-            "display_id": sc.display_id,
-            "name": linked.name if linked else None,
-            "description": linked.description if linked else None,
-            "shop_id": sc.shop_id,
-            "is_active": sc.is_active,
-        }
+    # No shop_display_id: return collections that are shop-scoped (have a shop_collection link).
+    subq = session.query(shop_collection.collection_id).distinct()
+    rows = session.query(collection).filter(collection.id.in_(subq)).order_by(collection.created_at.desc()).all()
+    for r in rows:
+        item = {"id": r.id, "display_id": r.display_id, "name": r.name, "description": r.description, "is_active": r.is_active}
+        # include shop bindings (one or more)
+        scs = session.query(shop_collection).filter(shop_collection.collection_id == r.id).all()
+        if scs:
+            item["shop_bindings"] = [{"shop_id": s.shop_id, "is_active": s.is_active} for s in scs]
         items.append(item)
     return {"items": items}
 
@@ -195,10 +207,22 @@ def create_collection(payload: CollectionCreateRequest, request: Request, sessio
 
         created_obj = c
     else:
-        # kind == shop: create only a shop-scoped collection (no system `collection` row)
-        sc = shop_collection(
+        # kind == shop: create a system `collection` row, then create a shop_collection
+        # linking that collection to the target shop. This keeps collection metadata
+        # centralized in `collection` while `shop_collection` records the shop binding.
+        c = collection(
             name=payload.name.strip(),
             description=payload.description.strip() if payload.description else None,
+            created_at=now,
+            updated_at=now,
+            is_active=True,
+        )
+        session.add(c)
+        session.flush()
+
+        # persist shop-specific link
+        sc = shop_collection(
+            collection_id=c.id,
             shop_id=target_shop_id,
             created_at=now,
             updated_at=now,
@@ -206,6 +230,8 @@ def create_collection(payload: CollectionCreateRequest, request: Request, sessio
         )
         session.add(sc)
         session.flush()
+        # return the shop_collection as the created object so the frontend continues
+        # to operate using shop_collection ids for shop-scoped collections
         created_obj = sc
 
     try:
@@ -220,10 +246,26 @@ def create_collection(payload: CollectionCreateRequest, request: Request, sessio
         pass
 
     # normalize result
+    # Canonical id everywhere is collection.id
     if kind == "system":
         result = {"id": created_obj.id, "display_id": getattr(created_obj, "display_id", None), "name": created_obj.name}
     else:
-        result = {"id": created_obj.id, "display_id": getattr(created_obj, "display_id", None), "name": created_obj.name, "shop_display_id": target_shop_display_id}
+        # created_obj is a `shop_collection` instance; try to load the linked collection
+        linked_name = None
+        linked_display_id = None
+        linked_id = getattr(created_obj, "collection_id", None)
+        try:
+            linked = None
+            if getattr(created_obj, "collection_id", None):
+                linked = session.query(collection).filter(collection.id == created_obj.collection_id).first()
+            if linked:
+                linked_id = linked.id
+                linked_name = linked.name
+                linked_display_id = getattr(linked, "display_id", None)
+        except Exception:
+            linked = None
+
+        result = {"id": linked_id, "display_id": linked_display_id, "name": linked_name, "shop_display_id": target_shop_display_id}
 
     return {"message": "Collection created", "collection": result}
 
@@ -242,12 +284,16 @@ def update_collection(collection_id: int, payload: CollectionUpdateRequest, requ
         role_val = role
     is_admin = str(role_val).lower() == "admin" if role_val else False
 
-    # Find whether this id corresponds to a system `collection` or a `shop_collection`
+    # Canonical id is always collection.id
     c = session.query(collection).filter(collection.id == collection_id).first()
-    sc = session.query(shop_collection).filter(shop_collection.id == collection_id).first()
+    if c is None:
+        raise HTTPException(status_code=404, detail="Collection not found")
 
-    # If system collection exists, only admin can update it
-    if c:
+    # Determine scope by existence of shop_collection entry for this collection
+    sc = session.query(shop_collection).filter(shop_collection.collection_id == collection_id).first()
+
+    # System collection: only admin can update
+    if sc is None:
         if not is_admin:
             raise HTTPException(status_code=403, detail="Only admin can update system collections")
 
@@ -263,11 +309,8 @@ def update_collection(collection_id: int, payload: CollectionUpdateRequest, requ
         session.refresh(c)
         return {"message": "Collection updated", "collection": {"id": c.id, "display_id": c.display_id, "name": c.name, "description": c.description, "is_active": c.is_active}}
 
-    # Otherwise, handle shop_collection updates (must exist)
-    if sc is None:
-        raise HTTPException(status_code=404, detail="Collection not found")
+    # Shop-scoped collection: admin or shop owner
 
-    # Allow admin or vendor owner to update shop_collection
     if not is_admin:
         vendor_shop_row = None
         try:
@@ -278,18 +321,32 @@ def update_collection(collection_id: int, payload: CollectionUpdateRequest, requ
         if vendor_shop_row is None or sc.shop_id != vendor_shop_row.id:
             raise HTTPException(status_code=403, detail="Not authorized to update this collection")
 
-    # perform update on shop_collection
+    # Update authoritative collection metadata (name/description)
     if payload.name is not None:
-        sc.name = payload.name.strip()
+        c.name = payload.name.strip()
     if payload.description is not None:
-        sc.description = payload.description.strip() or None
+        c.description = payload.description.strip() or None
+    c.updated_at = datetime.now()
+
+    # Keep is_active synchronized for shop-scoped collections
     if payload.is_active is not None:
+        c.is_active = payload.is_active
         sc.is_active = payload.is_active
     sc.updated_at = datetime.now()
-    session.commit()
-    session.refresh(sc)
 
-    return {"message": "Shop collection updated", "collection": {"id": sc.id, "display_id": getattr(sc, "display_id", None), "name": sc.name, "description": sc.description, "is_active": sc.is_active, "shop_id": sc.shop_id}}
+    session.commit()
+    # refresh both
+    try:
+        session.refresh(c)
+    except Exception:
+        pass
+    try:
+        session.refresh(sc)
+    except Exception:
+        pass
+
+    # return shop-scoped response using canonical collection id
+    return {"message": "Shop collection updated", "collection": {"id": c.id, "display_id": c.display_id, "name": c.name, "description": c.description, "is_active": sc.is_active, "shop_id": sc.shop_id}}
 
 
 @router.delete("/{collection_id}/delete")
@@ -306,48 +363,43 @@ def delete_collection(collection_id: int, request: Request, session: Session = D
         role_val = role
     is_admin = str(role_val).lower() == "admin" if role_val else False
 
-    # Try to find a system collection with this id
+    # Canonical id is always collection.id
     c = session.query(collection).filter(collection.id == collection_id).first()
-    if c:
-        # system collection found
-        if not is_admin:
-            # non-admin cannot delete system collections
-            raise HTTPException(status_code=403, detail="Only admin can delete system collections")
-
-        # delete related constraint rows if present
-        session.query(collection_shop).filter(collection_shop.collection_id == collection_id).delete()
-        session.query(collection_attribute_option).filter(collection_attribute_option.collection_id == collection_id).delete()
-        session.delete(c)
-        session.commit()
-        return {"message": "System collection and related constraints deleted"}
-
-    # Not a system collection; try shop_collection (vendor-owned collections)
-    sc = session.query(shop_collection).filter(shop_collection.id == collection_id).first()
-    if sc is None:
+    if c is None:
         raise HTTPException(status_code=404, detail="Collection not found")
 
-    # sc exists: allow admin or vendor owner
-    if not is_admin:
+    # Determine scope by shop_collection links for this collection
+    sc_rows = session.query(shop_collection).filter(shop_collection.collection_id == collection_id).all()
+    is_shop_scoped = len(sc_rows) > 0
+
+    # Authorization
+    if is_shop_scoped and not is_admin:
         # resolve vendor's shop
         vendor_shop_row = None
-        vendor_shop_display_id = None
         try:
             vendor_shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
-            if vendor_shop_row:
-                vendor_shop_display_id = vendor_shop_row.display_id
         except Exception:
             vendor_shop_row = None
 
-        # vendor can delete only their own shop_collection
-        if sc.shop_id is None:
+        # vendor can delete only collections bound to their own shop
+        if vendor_shop_row is None:
             raise HTTPException(status_code=403, detail="Not authorized to delete this collection")
-        # verify ownership by comparing shop ids
-        if vendor_shop_row is None or sc.shop_id != vendor_shop_row.id:
+        owns_all = all((s.shop_id == vendor_shop_row.id) for s in sc_rows)
+        if not owns_all:
             raise HTTPException(status_code=403, detail="Not authorized to delete this collection")
 
-    session.delete(sc)
+    if not is_shop_scoped and not is_admin:
+        # non-admin cannot delete system collections
+        raise HTTPException(status_code=403, detail="Only admin can delete system collections")
+
+    # Delete all dependent rows to avoid orphans, then delete collection
+    session.query(shop_collection).filter(shop_collection.collection_id == collection_id).delete()
+    session.query(collection_shop).filter(collection_shop.collection_id == collection_id).delete()
+    session.query(collection_attribute_option).filter(collection_attribute_option.collection_id == collection_id).delete()
+    session.query(collection_product).filter(collection_product.collection_id == collection_id).delete()
+    session.delete(c)
     session.commit()
-    return {"message": "Shop collection deleted"}
+    return {"message": "Collection and related records deleted"}
 
 
 @router.get("/{collection_id}/constraints")
@@ -368,10 +420,16 @@ def get_constraints(collection_id: int, request: Request, session: Session = Dep
         role_val = role
     is_admin = str(role_val).lower() == "admin" if role_val else False
 
-    # load shops and attribute constraints
+    # load allowed-shops constraints and attribute constraints
     shops = (
         session.query(collection_shop)
         .filter(collection_shop.collection_id == collection_id)
+        .all()
+    )
+    # shop-scoped collections are identified by shop_collection links
+    sc_links = (
+        session.query(shop_collection)
+        .filter(shop_collection.collection_id == collection_id)
         .all()
     )
     attrs = (
@@ -405,14 +463,14 @@ def get_constraints(collection_id: int, request: Request, session: Session = Dep
     except Exception:
         vendor_shop_row = None
 
-    # Determine if collection is shop-bound (has collection_shop rows linking to shops)
-    is_shop_bound = len(shops) > 0
+    # Determine if collection is shop-scoped (has shop_collection link)
+    is_shop_bound = len(sc_links) > 0
 
     if is_shop_bound:
-        # vendor may access only if they own one of the linked shops
-        if not vendor_shop_display_id:
+        # vendor may access only if they own one of the linked shop_collection shops
+        if vendor_shop_row is None:
             raise HTTPException(status_code=403, detail="Not authorized to view this collection constraints")
-        owns = any((s.shop_display_id and s.shop_display_id == vendor_shop_display_id) for s in shops)
+        owns = any((s.shop_id == vendor_shop_row.id) for s in sc_links)
         if not owns:
             raise HTTPException(status_code=403, detail="Not authorized to view this collection constraints")
     else:
@@ -452,26 +510,23 @@ def update_constraints(collection_id: int, payload: ConstraintsUpdateRequest, re
         role_val = role
     is_admin = str(role_val).lower() == "admin" if role_val else False
 
-    # For vendors, ensure collection is shop-bound and they own the shop
+    # For vendors, allow updates only for shop-scoped collections they own
     if not is_admin:
         vendor_shop_row = None
-        vendor_shop_display_id = None
         try:
             vendor_shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
-            if vendor_shop_row:
-                vendor_shop_display_id = vendor_shop_row.display_id
         except Exception:
             vendor_shop_row = None
 
-        shops = session.query(collection_shop).filter(collection_shop.collection_id == collection_id).all()
-        if not shops:
+        sc_links = session.query(shop_collection).filter(shop_collection.collection_id == collection_id).all()
+        if not sc_links:
             # system collections cannot be modified by vendors
             raise HTTPException(status_code=403, detail="Only admin can update system collection constraints")
 
-        if not vendor_shop_display_id:
+        if vendor_shop_row is None:
             raise HTTPException(status_code=403, detail="Not authorized to update collection constraints")
 
-        owns = any((s.shop_display_id and s.shop_display_id == vendor_shop_display_id) for s in shops)
+        owns = any((s.shop_id == vendor_shop_row.id) for s in sc_links)
         if not owns:
             raise HTTPException(status_code=403, detail="Not authorized to update collection constraints")
 
@@ -531,14 +586,20 @@ def get_products(collection_id: int, request: Request, session: Session = Depend
     if c is None:
         raise HTTPException(status_code=404, detail="Collection not found")
 
-    # load any collection_shop rows and treat their display ids as potential restrictions/ownership
+    # system constraints from collection_shop
     shops = (
         session.query(collection_shop)
         .filter(collection_shop.collection_id == collection_id)
         .all()
     )
+    # shop-scoped collections are identified by shop_collection links
+    sc_links = (
+        session.query(shop_collection)
+        .filter(shop_collection.collection_id == collection_id)
+        .all()
+    )
     shop_display_ids = [s.shop_display_id for s in shops if s.shop_display_id]
-    is_shop_bound = len(shops) > 0
+    is_shop_bound = len(sc_links) > 0
 
     # determine requester and role
     current_user = getattr(request.state, "current_user", None)
@@ -568,10 +629,10 @@ def get_products(collection_id: int, request: Request, session: Session = Depend
             vendor_shop_row = None
 
         if is_shop_bound:
-            # vendor may retrieve only if they own one of the linked shops
-            if not vendor_shop_display_id:
+            # vendor may retrieve only if they own one of the linked shop_collection shops
+            if vendor_shop_row is None:
                 raise HTTPException(status_code=403, detail="Not authorized to view this collection products")
-            owns = any((s.shop_display_id and s.shop_display_id == vendor_shop_display_id) for s in shops)
+            owns = any((s.shop_id == vendor_shop_row.id) for s in sc_links)
             if not owns:
                 raise HTTPException(status_code=403, detail="Not authorized to view this collection products")
         else:
@@ -645,22 +706,28 @@ def add_products(collection_id: int, payload: ProductsModifyRequest, request: Re
         except Exception:
             vendor_shop_row = None
 
-    # load any collection_shop rows to determine collection scope
+    # system constraints from collection_shop
     shops = (
         session.query(collection_shop)
         .filter(collection_shop.collection_id == collection_id)
         .all()
     )
+    # shop-scoped collections are identified by shop_collection links
+    sc_links = (
+        session.query(shop_collection)
+        .filter(shop_collection.collection_id == collection_id)
+        .all()
+    )
     shop_display_ids = [s.shop_display_id for s in shops if s.shop_display_id]
-    is_shop_bound = len(shops) > 0
+    is_shop_bound = len(sc_links) > 0
 
     # Non-admin pre-checks
     if not is_admin:
         if is_shop_bound:
-            # vendor must own one of the linked shops to modify members
-            if not vendor_shop_display_id:
+            # vendor must own one of the linked shop_collection shops
+            if vendor_shop_row is None:
                 raise HTTPException(status_code=403, detail="Not authorized to add products to this collection")
-            owns = any((s.shop_display_id and s.shop_display_id == vendor_shop_display_id) for s in shops)
+            owns = any((s.shop_id == vendor_shop_row.id) for s in sc_links)
             if not owns:
                 raise HTTPException(status_code=403, detail="Not authorized to add products to this collection")
         else:
@@ -741,22 +808,28 @@ def remove_products(collection_id: int, payload: ProductsModifyRequest, request:
         except Exception:
             vendor_shop_row = None
 
-    # load any collection_shop rows to determine collection scope
+    # system constraints from collection_shop
     shops = (
         session.query(collection_shop)
         .filter(collection_shop.collection_id == collection_id)
         .all()
     )
+    # shop-scoped collections are identified by shop_collection links
+    sc_links = (
+        session.query(shop_collection)
+        .filter(shop_collection.collection_id == collection_id)
+        .all()
+    )
     shop_display_ids = [s.shop_display_id for s in shops if s.shop_display_id]
-    is_shop_bound = len(shops) > 0
+    is_shop_bound = len(sc_links) > 0
 
     # Non-admin pre-checks
     if not is_admin:
         if is_shop_bound:
-            # vendor must own one of the linked shops to modify members
-            if not vendor_shop_display_id:
+            # vendor must own one of the linked shop_collection shops
+            if vendor_shop_row is None:
                 raise HTTPException(status_code=403, detail="Not authorized to remove products from this collection")
-            owns = any((s.shop_display_id and s.shop_display_id == vendor_shop_display_id) for s in shops)
+            owns = any((s.shop_id == vendor_shop_row.id) for s in sc_links)
             if not owns:
                 raise HTTPException(status_code=403, detail="Not authorized to remove products from this collection")
         else:
