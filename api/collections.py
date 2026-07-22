@@ -10,6 +10,7 @@ from db.db_models import (
     collection,
     collection_shop,
     shop_collection,
+    shop_collection_product,
     collection_attribute_option,
     collection_product,
     shop,
@@ -600,6 +601,9 @@ def get_products(collection_id: int, request: Request, session: Session = Depend
     )
     shop_display_ids = [s.shop_display_id for s in shops if s.shop_display_id]
     is_shop_bound = len(sc_links) > 0
+    owned_sc_rows = []
+    owned_sc_rows = []
+    owned_sc_rows = []
 
     # determine requester and role
     current_user = getattr(request.state, "current_user", None)
@@ -625,6 +629,11 @@ def get_products(collection_id: int, request: Request, session: Session = Depend
             vendor_shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
             if vendor_shop_row:
                 vendor_shop_display_id = vendor_shop_row.display_id
+                owned_sc_rows = (
+                    session.query(shop_collection)
+                    .filter(shop_collection.collection_id == collection_id, shop_collection.shop_id == vendor_shop_row.id)
+                    .all()
+                )
         except Exception:
             vendor_shop_row = None
 
@@ -632,7 +641,7 @@ def get_products(collection_id: int, request: Request, session: Session = Depend
             # vendor may retrieve only if they own one of the linked shop_collection shops
             if vendor_shop_row is None:
                 raise HTTPException(status_code=403, detail="Not authorized to view this collection products")
-            owns = any((s.shop_id == vendor_shop_row.id) for s in sc_links)
+            owns = len(owned_sc_rows) > 0
             if not owns:
                 raise HTTPException(status_code=403, detail="Not authorized to view this collection products")
         else:
@@ -645,18 +654,49 @@ def get_products(collection_id: int, request: Request, session: Session = Depend
                     raise HTTPException(status_code=403, detail="Not authorized to view this collection products")
 
     # Admins may view everything; at this point request is authorized to query products
-    rows = (
-        session.query(collection_product)
-        .filter(collection_product.collection_id == collection_id)
-        .order_by(collection_product.created_at.desc())
-        .all()
-    )
-    product_ids = [r.product_id for r in rows]
-    if not product_ids:
+    # Collect product ids from canonical collection_product rows
+    product_id_set = set()
+    try:
+        cp_rows = (
+            session.query(collection_product)
+            .filter(collection_product.collection_id == collection_id)
+            .order_by(collection_product.created_at.desc())
+            .all()
+        )
+        for r in cp_rows:
+            product_id_set.add(r.product_id)
+    except Exception:
+        pass
+
+    # Also collect members stored in shop_collection_product for any shop_collection links
+    try:
+        sc_rows = sc_links  # already queried above
+        sc_ids = [s.id for s in sc_rows]
+        if sc_ids:
+            # For non-admin vendors, restrict to their own shop_collection rows
+            if current_user is not None and not is_admin and vendor_shop_row:
+                owned_sc_ids = [s.id for s in owned_sc_rows]
+                sc_query_ids = owned_sc_ids
+            else:
+                sc_query_ids = sc_ids
+
+            if sc_query_ids:
+                scp_rows = (
+                    session.query(shop_collection_product)
+                    .filter(shop_collection_product.shop_collection_id.in_(sc_query_ids))
+                    .order_by(shop_collection_product.created_at.desc())
+                    .all()
+                )
+                for r in scp_rows:
+                    product_id_set.add(r.product_id)
+    except Exception:
+        pass
+
+    if not product_id_set:
         return {"items": []}
 
     # Base product query
-    prod_q = session.query(product).filter(product.id.in_(product_ids))
+    prod_q = session.query(product).filter(product.id.in_(list(product_id_set)))
 
     # Vendors requesting system collections should only receive their own products
     if current_user is not None and not is_admin:
@@ -698,11 +738,17 @@ def add_products(collection_id: int, payload: ProductsModifyRequest, request: Re
     # resolve vendor shop if non-admin
     vendor_shop_row = None
     vendor_shop_display_id = None
+    owned_sc_rows = []
     if not is_admin:
         try:
             vendor_shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
             if vendor_shop_row:
                 vendor_shop_display_id = vendor_shop_row.display_id
+                owned_sc_rows = (
+                    session.query(shop_collection)
+                    .filter(shop_collection.collection_id == collection_id, shop_collection.shop_id == vendor_shop_row.id)
+                    .all()
+                )
         except Exception:
             vendor_shop_row = None
 
@@ -727,7 +773,7 @@ def add_products(collection_id: int, payload: ProductsModifyRequest, request: Re
             # vendor must own one of the linked shop_collection shops
             if vendor_shop_row is None:
                 raise HTTPException(status_code=403, detail="Not authorized to add products to this collection")
-            owns = any((s.shop_id == vendor_shop_row.id) for s in sc_links)
+            owns = len(owned_sc_rows) > 0
             if not owns:
                 raise HTTPException(status_code=403, detail="Not authorized to add products to this collection")
         else:
@@ -765,18 +811,33 @@ def add_products(collection_id: int, payload: ProductsModifyRequest, request: Re
                 # skip products that do not belong to the vendor
                 continue
 
-        exists = (
-            session.query(collection_product)
-            .filter(collection_product.collection_id == collection_id, collection_product.product_id == p.id)
-            .first()
-        )
-        if exists:
-            continue
-        cp = collection_product(collection_id=collection_id, product_id=p.id, created_at=now, updated_at=now, is_active=True)
-        session.add(cp)
-        added += 1
+        if (is_shop_bound or len(owned_sc_rows) > 0) and not is_admin:
+            # add to shop_collection_product for the vendor's shop_collection(s)
+            for sc in owned_sc_rows:
+                exists = (
+                    session.query(shop_collection_product)
+                    .filter(shop_collection_product.shop_collection_id == sc.id, shop_collection_product.product_id == p.id)
+                    .first()
+                )
+                if exists:
+                    continue
+                scp = shop_collection_product(shop_collection_id=sc.id, product_id=p.id, created_at=now, updated_at=now, is_active=True)
+                session.add(scp)
+                added += 1
+        else:
+            exists = (
+                session.query(collection_product)
+                .filter(collection_product.collection_id == collection_id, collection_product.product_id == p.id)
+                .first()
+            )
+            if exists:
+                continue
+            cp = collection_product(collection_id=collection_id, product_id=p.id, created_at=now, updated_at=now, is_active=True)
+            session.add(cp)
+            added += 1
     session.commit()
-    return {"message": "Products added", "added": added}
+    storage = "shop_collection_products" if ((not is_admin) and (is_shop_bound or len(owned_sc_rows) > 0)) else "collection_products"
+    return {"message": "Products added", "added": added, "storage": storage, "collection_id": collection_id}
 
 
 @router.post("/{collection_id}/remove")
@@ -800,11 +861,17 @@ def remove_products(collection_id: int, payload: ProductsModifyRequest, request:
     # resolve vendor shop if non-admin
     vendor_shop_row = None
     vendor_shop_display_id = None
+    owned_sc_rows = []
     if not is_admin:
         try:
             vendor_shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
             if vendor_shop_row:
                 vendor_shop_display_id = vendor_shop_row.display_id
+                owned_sc_rows = (
+                    session.query(shop_collection)
+                    .filter(shop_collection.collection_id == collection_id, shop_collection.shop_id == vendor_shop_row.id)
+                    .all()
+                )
         except Exception:
             vendor_shop_row = None
 
@@ -829,7 +896,7 @@ def remove_products(collection_id: int, payload: ProductsModifyRequest, request:
             # vendor must own one of the linked shop_collection shops
             if vendor_shop_row is None:
                 raise HTTPException(status_code=403, detail="Not authorized to remove products from this collection")
-            owns = any((s.shop_id == vendor_shop_row.id) for s in sc_links)
+            owns = len(owned_sc_rows) > 0
             if not owns:
                 raise HTTPException(status_code=403, detail="Not authorized to remove products from this collection")
         else:
@@ -867,12 +934,23 @@ def remove_products(collection_id: int, payload: ProductsModifyRequest, request:
                 # skip products that do not belong to the vendor
                 continue
 
-        deleted = (
-            session.query(collection_product)
-            .filter(collection_product.collection_id == collection_id, collection_product.product_id == p.id)
-            .delete()
-        )
-        removed += deleted
+        if (is_shop_bound or len(owned_sc_rows) > 0) and not is_admin:
+            # remove from shop_collection_product for vendor's shop_collection(s)
+            for sc in owned_sc_rows:
+                deleted = (
+                    session.query(shop_collection_product)
+                    .filter(shop_collection_product.shop_collection_id == sc.id, shop_collection_product.product_id == p.id)
+                    .delete()
+                )
+                removed += deleted
+        else:
+            deleted = (
+                session.query(collection_product)
+                .filter(collection_product.collection_id == collection_id, collection_product.product_id == p.id)
+                .delete()
+            )
+            removed += deleted
 
     session.commit()
-    return {"message": "Products removed", "removed": removed}
+    storage = "shop_collection_products" if ((not is_admin) and (is_shop_bound or len(owned_sc_rows) > 0)) else "collection_products"
+    return {"message": "Products removed", "removed": removed, "storage": storage, "collection_id": collection_id}
