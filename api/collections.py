@@ -74,6 +74,15 @@ def list_collections(kind: Optional[str] = None, shop_display_id: Optional[str] 
             # include linked constraint shops (collection_shops) when present
             shops = session.query(collection_shop).filter(collection_shop.collection_id == r.id).all()
             shop_display_ids = [s.shop_display_id for s in shops if s.shop_display_id]
+
+            # If caller specifies a shop context, only return system collections
+            # the shop is allowed to add to:
+            # - no constraints => allowed for any shop
+            # - constrained => allowed only when shop_display_id is present in constraints
+            if shop_display_id:
+                if shop_display_ids and shop_display_id not in shop_display_ids:
+                    continue
+
             if shop_display_ids:
                 item["shop_display_ids"] = shop_display_ids
             items.append(item)
@@ -787,10 +796,29 @@ def add_products(collection_id: int, payload: ProductsModifyRequest, request: Re
 
     now = datetime.now()
     added = 0
+    blocked_by_constraints = 0
     for pdid in payload.product_display_ids:
         p = session.query(product).filter(product.display_id == pdid).first()
         if not p:
             continue
+
+        # For system collections, enforce allowed-shop constraints per product for
+        # all callers (admin and vendor). If no constraints exist, any shop is allowed.
+        if not is_shop_bound and shop_display_ids:
+            product_shop_display_id = None
+            try:
+                if getattr(p, "shop_display_id", None):
+                    product_shop_display_id = p.shop_display_id
+                elif getattr(p, "shop_id", None):
+                    shop_row = session.query(shop).filter(shop.id == p.shop_id).first()
+                    if shop_row:
+                        product_shop_display_id = shop_row.display_id
+            except Exception:
+                product_shop_display_id = None
+
+            if not product_shop_display_id or product_shop_display_id not in shop_display_ids:
+                blocked_by_constraints += 1
+                continue
 
         # enforce per-product ownership for non-admins: vendor may only add their own products
         if not is_admin:
@@ -837,7 +865,13 @@ def add_products(collection_id: int, payload: ProductsModifyRequest, request: Re
             added += 1
     session.commit()
     storage = "shop_collection_products" if ((not is_admin) and (is_shop_bound or len(owned_sc_rows) > 0)) else "collection_products"
-    return {"message": "Products added", "added": added, "storage": storage, "collection_id": collection_id}
+    return {
+        "message": "Products added",
+        "added": added,
+        "blocked_by_constraints": blocked_by_constraints,
+        "storage": storage,
+        "collection_id": collection_id,
+    }
 
 
 @router.post("/{collection_id}/remove")
