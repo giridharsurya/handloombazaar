@@ -1,4 +1,5 @@
 from typing import Optional, List
+import json
 from pydantic import BaseModel
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -14,6 +15,7 @@ from db.db_models import (
     attribute_option,
     product,
     product_attribute,
+    product_group,
     product_image,
     shop,
     user as UserModel,
@@ -38,6 +40,20 @@ class ProductListItem(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+    attributes: list[dict] = []
+
+
+class FilterAttributeOption(BaseModel):
+    id: int
+    value: str
+
+
+class FilterAttribute(BaseModel):
+    id: int
+    name: str
+    is_filterable: bool = False
+    is_required: bool = False
+    options: list[FilterAttributeOption]
 
 
 class ProductsResponseData(BaseModel):
@@ -66,6 +82,13 @@ class ShopSummary(BaseModel):
     display_id: str
     name: str
     shop_logo_url: str
+    email: str
+    phone_number: str
+    address: str
+    website_url: Optional[str] = None
+    youtube_url: Optional[str] = None
+    instagram_url: Optional[str] = None
+    facebook_url: Optional[str] = None
 
 
 class ProductDetail(BaseModel):
@@ -74,6 +97,10 @@ class ProductDetail(BaseModel):
     description: Optional[str]
     price: int
     discount_price: Optional[int]
+    stock_quantity: int
+    product_group_id: Optional[int]
+    group_product_count: int
+    video_url: Optional[str]
     created_at: datetime
     updated_at: datetime
     is_active: bool
@@ -102,6 +129,7 @@ class ProductCreateRequest(BaseModel):
     discount_price: Optional[int]
     stock_quantity: int
     images: List[str]
+    attributes: Optional[List[dict]] = None
 
 
 class ProductCreateDetail(BaseModel):
@@ -116,6 +144,20 @@ class ProductCreateResponse(BaseModel):
     data: ProductCreateDetail
 
 
+class ProductUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[int] = None
+    discount_price: Optional[int] = None
+    stock_quantity: Optional[int] = None
+    video_url: Optional[str] = None
+    product_group_id: Optional[int] = None
+    is_active: Optional[bool] = None
+    attributes: Optional[List[dict]] = None
+    image_urls: Optional[List[str]] = None
+    primary_image_index: Optional[int] = None
+
+
 def _serialize_listing_product(session: Session, item: product):
     shop_row = session.query(shop).filter(shop.id == item.shop_id).first()
     primary_image = (
@@ -126,6 +168,12 @@ def _serialize_listing_product(session: Session, item: product):
 
     primary_image_row = primary_image.first()
     image_url = primary_image_row.image_url if primary_image_row else None
+    product_attribute_rows = (
+        session.query(product_attribute, attribute_option)
+        .join(attribute_option, product_attribute.attribute_option_id == attribute_option.id)
+        .filter(product_attribute.product_id == item.id)
+        .all()
+    )
 
     return {
         "display_id": item.display_id,
@@ -139,11 +187,30 @@ def _serialize_listing_product(session: Session, item: product):
         "price": item.price,
         "discount_price": item.discount_price,
         "is_active": item.is_active,
+        "attributes": [
+            {
+                "definition_id": attr.attribute_definition_id,
+                "option_id": attr.attribute_option_id,
+                "option_value": opt.option_value,
+            }
+            for attr, opt in product_attribute_rows
+        ],
     }
 
 
 def _serialize_product_detail(session: Session, item: product):
     shop_row = session.query(shop).filter(shop.id == item.shop_id).first()
+
+    group_count = 1
+    if item.product_group_id is not None:
+        group_count = (
+            session.query(product)
+            .filter(
+                product.shop_id == item.shop_id,
+                product.product_group_id == item.product_group_id,
+            )
+            .count()
+        )
 
     images = (
         session.query(product_image)
@@ -169,6 +236,10 @@ def _serialize_product_detail(session: Session, item: product):
         "description": item.description,
         "price": item.price,
         "discount_price": item.discount_price,
+        "stock_quantity": item.stock_quantity,
+        "product_group_id": item.product_group_id,
+        "group_product_count": group_count,
+        "video_url": item.video_url,
         "created_at": item.created_at,
         "updated_at": item.updated_at,
         "is_active": item.is_active,
@@ -176,6 +247,13 @@ def _serialize_product_detail(session: Session, item: product):
             "display_id": shop_row.display_id,
             "name": shop_row.name,
             "shop_logo_url": shop_row.shop_logo_url,
+            "email": shop_row.email,
+            "phone_number": shop_row.phone_number,
+            "address": shop_row.address,
+            "website_url": shop_row.website_url,
+            "youtube_url": shop_row.youtube_url,
+            "instagram_url": shop_row.instagram_url,
+            "facebook_url": shop_row.facebook_url,
         },
         "images": [img.image_url for img in images],
         "attributes": [
@@ -228,7 +306,7 @@ def _apply_attribute_filters(base_query, attribute_filters: list[str]):
     return base_query
 
 
-@products_router.get("/", response_model=ProductsResponse)
+@products_router.get("", response_model=ProductsResponse)
 def get_products(
     request: Request,
     page: int = Query(1, ge=1),
@@ -309,6 +387,80 @@ def get_products(
     return ProductsResponse(success=True, message="Products retrieved successfully", data=temp)
 
 
+@products_router.get("/filters/attributes", response_model=list[FilterAttribute])
+def get_filterable_attributes(session: Session = Depends(get_session)):
+    rows = (
+        session.query(attribute_definition)
+        .filter(
+            attribute_definition.is_active.is_(True),
+            attribute_definition.is_filterable.is_(True),
+        )
+        .order_by(attribute_definition.attribute_name.asc())
+        .all()
+    )
+
+    result: list[FilterAttribute] = []
+    for row in rows:
+        options = (
+            session.query(attribute_option)
+            .filter(
+                attribute_option.attribute_definition_id == row.id,
+                attribute_option.is_active.is_(True),
+            )
+            .order_by(attribute_option.option_value.asc())
+            .all()
+        )
+        if not options:
+            continue
+        result.append(
+            FilterAttribute(
+                id=row.id,
+                name=row.attribute_name,
+                is_filterable=row.is_filterable,
+                is_required=row.is_required,
+                options=[FilterAttributeOption(id=opt.id, value=opt.option_value) for opt in options],
+            )
+        )
+
+    return result
+
+
+@products_router.get("/attributes", response_model=list[FilterAttribute])
+def get_editable_attributes(session: Session = Depends(get_session)):
+    rows = (
+        session.query(attribute_definition)
+        .filter(attribute_definition.is_active.is_(True))
+        .order_by(attribute_definition.attribute_name.asc())
+        .all()
+    )
+
+    result: list[FilterAttribute] = []
+    for row in rows:
+        options = (
+            session.query(attribute_option)
+            .filter(
+                attribute_option.attribute_definition_id == row.id,
+                attribute_option.is_active.is_(True),
+            )
+            .order_by(attribute_option.option_value.asc())
+            .all()
+        )
+        if not options:
+            continue
+
+        result.append(
+            FilterAttribute(
+                id=row.id,
+                name=row.attribute_name,
+                is_filterable=row.is_filterable,
+                is_required=row.is_required,
+                options=[FilterAttributeOption(id=opt.id, value=opt.option_value) for opt in options],
+            )
+        )
+
+    return result
+
+
 @products_router.get("/{product_id}", response_model=ProductDetailResponse)
 def get_product_details(
     request: Request,
@@ -346,6 +498,10 @@ def get_product_details(
         description=detail.get("description"),
         price=detail["price"],
         discount_price=detail.get("discount_price"),
+        stock_quantity=detail.get("stock_quantity"),
+        product_group_id=detail.get("product_group_id"),
+        group_product_count=detail.get("group_product_count", 1),
+        video_url=detail.get("video_url"),
         created_at=detail.get("created_at"),
         updated_at=detail.get("updated_at"),
         is_active=detail.get("is_active"),
@@ -402,8 +558,371 @@ def get_product_variants(
     return ProductVariantsResponse(success=True, message="Product variants retrieved successfully", data=items)
 
 
+@products_router.put("/{product_id}", response_model=ProductDetailResponse)
+async def update_product(
+    product_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    current_user: Optional[UserModel] = getattr(request.state, "current_user", None)
+
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required to update products")
+
+    target_product = session.query(product).filter(product.display_id == product_id).first()
+    if not target_product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    if current_user.role == UserRole.SHOP_OWNER:
+        owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if not owner_shop or owner_shop.id != target_product.shop_id:
+            raise HTTPException(status_code=403, detail="Not authorized to update this product")
+    elif current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Insufficient privileges to update products")
+
+    content_type = request.headers.get("content-type", "")
+    now = datetime.now()
+    parsed_attributes: Optional[list[dict]] = None
+    parsed_image_urls: Optional[list[str]] = None
+    uploaded_image_urls: list[str] = []
+    primary_image_index: Optional[int] = None
+
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+
+        if "name" in form:
+            name = str(form.get("name") or "").strip()
+            if not name:
+                raise HTTPException(status_code=422, detail="Product name cannot be empty")
+            target_product.name = name
+
+        if "description" in form:
+            description = form.get("description")
+            target_product.description = str(description).strip() if description not in (None, "") else None
+
+        if "price" in form:
+            try:
+                price = int(str(form.get("price")))
+            except Exception:
+                raise HTTPException(status_code=422, detail="Invalid price value")
+            if price < 0:
+                raise HTTPException(status_code=422, detail="Price must be non-negative")
+            target_product.price = price
+
+        if "discount_price" in form or "discounted_price" in form:
+            discount_raw = form.get("discount_price") or form.get("discounted_price")
+            if discount_raw in (None, ""):
+                target_product.discount_price = None
+            else:
+                try:
+                    discount_price = int(str(discount_raw))
+                except Exception:
+                    raise HTTPException(status_code=422, detail="Invalid discount_price value")
+                if discount_price < 0:
+                    raise HTTPException(status_code=422, detail="Discount price must be non-negative")
+                target_product.discount_price = discount_price
+
+        if "stock_quantity" in form:
+            try:
+                stock_quantity = int(str(form.get("stock_quantity")))
+            except Exception:
+                raise HTTPException(status_code=422, detail="Invalid stock_quantity value")
+            if stock_quantity < 0:
+                raise HTTPException(status_code=422, detail="Stock quantity must be non-negative")
+            target_product.stock_quantity = stock_quantity
+
+        if "video_url" in form:
+            video_url = form.get("video_url")
+            target_product.video_url = str(video_url).strip() if video_url not in (None, "") else None
+
+        if "product_group_id" in form:
+            raw_group_id = form.get("product_group_id")
+            if raw_group_id in (None, ""):
+                target_product.product_group_id = None
+            else:
+                try:
+                    parsed_group_id = int(str(raw_group_id))
+                except Exception:
+                    raise HTTPException(status_code=422, detail="Invalid product_group_id value")
+
+                group_row = (
+                    session.query(product_group)
+                    .filter(product_group.id == parsed_group_id, product_group.shop_id == target_product.shop_id)
+                    .first()
+                )
+                if not group_row:
+                    raise HTTPException(status_code=400, detail="Product group not found for this shop")
+                target_product.product_group_id = parsed_group_id
+
+        if "is_active" in form:
+            raw_active = str(form.get("is_active") or "").strip().lower()
+            if raw_active in {"true", "1", "yes"}:
+                target_product.is_active = True
+            elif raw_active in {"false", "0", "no"}:
+                target_product.is_active = False
+            else:
+                raise HTTPException(status_code=422, detail="Invalid is_active value")
+
+        if "attributes" in form:
+            attributes_raw = form.get("attributes")
+            if attributes_raw in (None, ""):
+                parsed_attributes = []
+            else:
+                try:
+                    loaded_attributes = json.loads(str(attributes_raw))
+                except Exception:
+                    raise HTTPException(status_code=422, detail="Invalid attributes JSON")
+                if not isinstance(loaded_attributes, list):
+                    raise HTTPException(status_code=422, detail="Attributes must be a list")
+                parsed_attributes = loaded_attributes
+
+        if "image_urls" in form:
+            image_urls_raw = form.get("image_urls")
+            if image_urls_raw in (None, ""):
+                parsed_image_urls = []
+            else:
+                try:
+                    loaded_image_urls = json.loads(str(image_urls_raw))
+                except Exception:
+                    raise HTTPException(status_code=422, detail="Invalid image_urls JSON")
+                if not isinstance(loaded_image_urls, list) or any(not isinstance(item, str) for item in loaded_image_urls):
+                    raise HTTPException(status_code=422, detail="image_urls must be a string list")
+                parsed_image_urls = [item for item in loaded_image_urls if item]
+
+        if "primary_image_index" in form:
+            primary_raw = form.get("primary_image_index")
+            if primary_raw in (None, ""):
+                primary_image_index = 0
+            else:
+                try:
+                    primary_image_index = int(str(primary_raw))
+                except Exception:
+                    raise HTTPException(status_code=422, detail="Invalid primary_image_index value")
+
+        upload_files: list[UploadFile] = []
+        for key, value in form.multi_items():
+            if key == "images" and hasattr(value, "filename"):
+                upload_files.append(value)
+
+        if upload_files:
+            uploads_dir = Path("static") / "uploads"
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+            for uf in upload_files:
+                orig = getattr(uf, "filename", "upload")
+                ext = Path(orig).suffix or ""
+                fname = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}{ext}"
+                safe_path = uploads_dir / fname
+                try:
+                    with safe_path.open("wb") as out_file:
+                        shutil.copyfileobj(uf.file, out_file)
+                    uploaded_image_urls.append(f"/static/uploads/{fname}")
+                finally:
+                    try:
+                        uf.file.close()
+                    except Exception:
+                        pass
+
+    else:
+        body = await request.json()
+        if "discounted_price" in body and "discount_price" not in body:
+            body["discount_price"] = body.pop("discounted_price")
+
+        try:
+            ProductUpdateRequest(**body)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+        if "name" in body:
+            name = str(body.get("name") or "").strip()
+            if not name:
+                raise HTTPException(status_code=422, detail="Product name cannot be empty")
+            target_product.name = name
+
+        if "description" in body:
+            description = body.get("description")
+            target_product.description = str(description).strip() if description not in (None, "") else None
+
+        if "price" in body:
+            price = body.get("price")
+            if not isinstance(price, int) or price < 0:
+                raise HTTPException(status_code=422, detail="Price must be a non-negative integer")
+            target_product.price = price
+
+        if "discount_price" in body:
+            discount_price = body.get("discount_price")
+            if discount_price in (None, ""):
+                target_product.discount_price = None
+            elif not isinstance(discount_price, int) or discount_price < 0:
+                raise HTTPException(status_code=422, detail="Discount price must be a non-negative integer")
+            else:
+                target_product.discount_price = discount_price
+
+        if "stock_quantity" in body:
+            stock_quantity = body.get("stock_quantity")
+            if not isinstance(stock_quantity, int) or stock_quantity < 0:
+                raise HTTPException(status_code=422, detail="Stock quantity must be a non-negative integer")
+            target_product.stock_quantity = stock_quantity
+
+        if "video_url" in body:
+            video_url = body.get("video_url")
+            target_product.video_url = str(video_url).strip() if video_url not in (None, "") else None
+
+        if "product_group_id" in body:
+            incoming_group_id = body.get("product_group_id")
+            if incoming_group_id in (None, ""):
+                target_product.product_group_id = None
+            elif not isinstance(incoming_group_id, int):
+                raise HTTPException(status_code=422, detail="product_group_id must be an integer")
+            else:
+                group_row = (
+                    session.query(product_group)
+                    .filter(product_group.id == incoming_group_id, product_group.shop_id == target_product.shop_id)
+                    .first()
+                )
+                if not group_row:
+                    raise HTTPException(status_code=400, detail="Product group not found for this shop")
+                target_product.product_group_id = incoming_group_id
+
+        if "is_active" in body:
+            is_active = body.get("is_active")
+            if not isinstance(is_active, bool):
+                raise HTTPException(status_code=422, detail="is_active must be a boolean")
+            target_product.is_active = is_active
+
+        if "attributes" in body:
+            attrs = body.get("attributes")
+            if attrs is None:
+                parsed_attributes = []
+            elif not isinstance(attrs, list):
+                raise HTTPException(status_code=422, detail="Attributes must be a list")
+            else:
+                parsed_attributes = attrs
+
+        if "image_urls" in body:
+            image_urls = body.get("image_urls")
+            if image_urls is None:
+                parsed_image_urls = []
+            elif not isinstance(image_urls, list) or any(not isinstance(item, str) for item in image_urls):
+                raise HTTPException(status_code=422, detail="image_urls must be a string list")
+            else:
+                parsed_image_urls = [item for item in image_urls if item]
+
+        if "primary_image_index" in body:
+            incoming_primary_index = body.get("primary_image_index")
+            if incoming_primary_index is None:
+                primary_image_index = 0
+            elif not isinstance(incoming_primary_index, int):
+                raise HTTPException(status_code=422, detail="primary_image_index must be an integer")
+            else:
+                primary_image_index = incoming_primary_index
+
+    if parsed_attributes is not None:
+        normalized_pairs: list[tuple[int, int]] = []
+        for row in parsed_attributes:
+            if not isinstance(row, dict):
+                continue
+            definition_id = row.get("definition_id")
+            option_id = row.get("option_id")
+            if definition_id is None or option_id is None:
+                continue
+            try:
+                normalized_pairs.append((int(definition_id), int(option_id)))
+            except Exception:
+                raise HTTPException(status_code=422, detail="Invalid attribute identifiers")
+
+        dedup_by_definition: dict[int, int] = {}
+        for definition_id, option_id in normalized_pairs:
+            dedup_by_definition[definition_id] = option_id
+
+        if dedup_by_definition:
+            option_rows = (
+                session.query(attribute_option)
+                .filter(attribute_option.id.in_(list(dedup_by_definition.values())))
+                .all()
+            )
+            option_by_id = {opt.id: opt for opt in option_rows}
+
+            for definition_id, option_id in dedup_by_definition.items():
+                option_row = option_by_id.get(option_id)
+                if option_row is None:
+                    raise HTTPException(status_code=400, detail=f"Attribute option not found: {option_id}")
+                if option_row.attribute_definition_id != definition_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Attribute option {option_id} does not belong to definition {definition_id}",
+                    )
+
+        session.query(product_attribute).filter(product_attribute.product_id == target_product.id).delete(
+            synchronize_session=False
+        )
+
+        for definition_id, option_id in dedup_by_definition.items():
+            session.add(
+                product_attribute(
+                    product_id=target_product.id,
+                    attribute_definition_id=definition_id,
+                    attribute_option_id=option_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    images_update_requested = parsed_image_urls is not None or len(uploaded_image_urls) > 0
+    if images_update_requested:
+        final_urls = (parsed_image_urls or []) + uploaded_image_urls
+        if len(final_urls) == 0:
+            raise HTTPException(status_code=422, detail="At least one image is required")
+
+        if primary_image_index is None:
+            primary_image_index = 0
+        if primary_image_index < 0 or primary_image_index >= len(final_urls):
+            raise HTTPException(status_code=422, detail="primary_image_index is out of range")
+
+        session.query(product_image).filter(product_image.product_id == target_product.id).delete(
+            synchronize_session=False
+        )
+
+        for idx, url in enumerate(final_urls):
+            session.add(
+                product_image(
+                    product_id=target_product.id,
+                    image_url=url,
+                    primary_image=(idx == primary_image_index),
+                    created_at=now,
+                    updated_at=now,
+                    is_active=True,
+                )
+            )
+
+    target_product.updated_at = now
+    session.add(target_product)
+    session.commit()
+    session.refresh(target_product)
+
+    detail = _serialize_product_detail(session, target_product)
+    product_model = ProductDetail(
+        display_id=detail["display_id"],
+        name=detail["name"],
+        description=detail.get("description"),
+        price=detail["price"],
+        discount_price=detail.get("discount_price"),
+        stock_quantity=detail.get("stock_quantity"),
+        product_group_id=detail.get("product_group_id"),
+        group_product_count=detail.get("group_product_count", 1),
+        video_url=detail.get("video_url"),
+        created_at=detail.get("created_at"),
+        updated_at=detail.get("updated_at"),
+        is_active=detail.get("is_active"),
+        shop=ShopSummary(**detail.get("shop", {})),
+        images=detail.get("images", []),
+        attributes=[ProductAttributeItem(**a) for a in detail.get("attributes", [])],
+    )
+
+    return ProductDetailResponse(success=True, message="Product updated successfully", product=product_model)
+
+
 @products_router.post("/create", response_model=ProductCreateResponse)
-@products_router.post("/", response_model=ProductCreateResponse)
+@products_router.post("", response_model=ProductCreateResponse)
 async def create_product(request: Request, session: Session = Depends(get_session)):
     current_user: Optional[UserModel] = getattr(request.state, "current_user", None)
 
@@ -413,6 +932,7 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
     # Support both JSON body and multipart/form-data uploads.
     content_type = request.headers.get("content-type", "")
     images_urls: list[str] = []
+    parsed_attributes: list[dict] = []
 
     if content_type.startswith("multipart/form-data"):
         form = await request.form()
@@ -424,6 +944,7 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
         # accept alias 'discounted_price' as well
         discount_raw = form.get("discount_price") or form.get("discounted_price")
         stock_raw = form.get("stock_quantity")
+        attributes_raw = form.get("attributes")
 
         # collect uploaded files from repeated 'images' fields
         upload_files: list[UploadFile] = []
@@ -471,6 +992,15 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
             except Exception:
                 raise HTTPException(status_code=422, detail="Invalid discount_price value")
 
+        if attributes_raw not in (None, ""):
+            try:
+                loaded_attributes = json.loads(str(attributes_raw))
+            except Exception:
+                raise HTTPException(status_code=422, detail="Invalid attributes JSON")
+            if not isinstance(loaded_attributes, list):
+                raise HTTPException(status_code=422, detail="Attributes must be a list")
+            parsed_attributes = loaded_attributes
+
     else:
         # JSON body path
         body = await request.json()
@@ -490,6 +1020,7 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
         discount_price = int(payload.discount_price) if payload.discount_price not in (None, "") else None
         stock_quantity = int(payload.stock_quantity)
         images_urls = payload.images or []
+        parsed_attributes = payload.attributes or []
 
     shop_row = session.query(shop).filter(shop.display_id == shop_display_id).first()
     if not shop_row:
@@ -534,6 +1065,53 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
             is_active=True,
         )
         session.add(img)
+
+    # Persist attribute selections when provided.
+    normalized_pairs: list[tuple[int, int]] = []
+    for row in parsed_attributes:
+        if not isinstance(row, dict):
+            continue
+        definition_id = row.get("definition_id")
+        option_id = row.get("option_id")
+        if definition_id is None or option_id is None:
+            continue
+        try:
+            normalized_pairs.append((int(definition_id), int(option_id)))
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid attribute identifiers")
+
+    # De-duplicate by definition to satisfy unique constraint (keep the last selected option).
+    dedup_by_definition: dict[int, int] = {}
+    for definition_id, option_id in normalized_pairs:
+        dedup_by_definition[definition_id] = option_id
+
+    if dedup_by_definition:
+        option_rows = (
+            session.query(attribute_option)
+            .filter(attribute_option.id.in_(list(dedup_by_definition.values())))
+            .all()
+        )
+        option_by_id = {opt.id: opt for opt in option_rows}
+
+        for definition_id, option_id in dedup_by_definition.items():
+            option_row = option_by_id.get(option_id)
+            if option_row is None:
+                raise HTTPException(status_code=400, detail=f"Attribute option not found: {option_id}")
+            if option_row.attribute_definition_id != definition_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Attribute option {option_id} does not belong to definition {definition_id}",
+                )
+
+            session.add(
+                product_attribute(
+                    product_id=p.id,
+                    attribute_definition_id=definition_id,
+                    attribute_option_id=option_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
 
     session.commit()
     data = {

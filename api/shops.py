@@ -207,7 +207,7 @@ def update_shop_logo(
     return _build_shop_detail_response(selected_shop)
 
 
-@shops_router.get("/", response_model=list[ShopStatusResponse])
+@shops_router.get("", response_model=list[ShopStatusResponse])
 def list_shops(session: Session = Depends(get_session)):
     rows = session.query(shop).filter(shop.approved.is_(True), shop.is_active.is_(True)).order_by(shop.created_at.desc()).all()
     return [

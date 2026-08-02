@@ -45,7 +45,7 @@ def _load_seed_rows(file_name: str) -> list[dict]:
 
     return rows
 
-@create_router.post("/")
+@create_router.post("")
 def create_product(engine = Depends(get_engine)):
     # Create the database tables if they don't exist
     Base.metadata.create_all(bind=engine)

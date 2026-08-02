@@ -7,7 +7,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from db.database import get_session
-from db.db_models import attribute_definition, attribute_option, collection, shop, UserRole
+from db.db_models import (
+    attribute_definition,
+    attribute_option,
+    collection,
+    product,
+    product_attribute,
+    shop,
+    UserRole,
+)
 
 
 def require_admin(request: Request):
@@ -62,6 +70,16 @@ class AttributeUpdateRequest(BaseModel):
 
 class AttributeOptionUpdateRequest(BaseModel):
     option_value: Optional[str] = Field(default=None, min_length=1, max_length=255)
+
+
+class ProductAttributeBackfillItem(BaseModel):
+    attribute_name: str = Field(min_length=1, max_length=255)
+    option_value: str = Field(min_length=1, max_length=255)
+
+
+class ProductAttributeBackfillRequest(BaseModel):
+    selections: list[ProductAttributeBackfillItem] = Field(default_factory=list)
+    overwrite_existing: bool = True
 
 
 @admin_router.get("/shops")
@@ -419,7 +437,8 @@ def delete_attribute_option(
     if selected_option is None:
         raise HTTPException(status_code=404, detail="Option not found")
 
-    # Database CASCADE will automatically delete related product_attribute records
+    # Explicit cleanup keeps behavior correct even if DB FK cascade is missing in an environment.
+    session.query(product_attribute).filter(product_attribute.attribute_option_id == option_id).delete()
     session.delete(selected_option)
     session.commit()
 
@@ -467,6 +486,9 @@ def delete_attribute(attribute_id: int, session: Session = Depends(get_session))
     if selected_attribute is None:
         raise HTTPException(status_code=404, detail="Attribute not found")
 
+    # Explicit cleanup keeps behavior correct even if DB FK cascade is missing in an environment.
+    session.query(product_attribute).filter(product_attribute.attribute_definition_id == attribute_id).delete()
+
     # Explicitly delete related attribute options to be safe
     try:
         session.query(attribute_option).filter(attribute_option.attribute_definition_id == attribute_id).delete()
@@ -483,3 +505,86 @@ def delete_attribute(attribute_id: int, session: Session = Depends(get_session))
         raise HTTPException(status_code=500, detail="Failed to delete attribute definition")
 
     return {"message": "Attribute and all associated options deleted successfully"}
+
+
+@admin_router.post("/products/{product_display_id}/attributes/backfill")
+def backfill_product_attributes(
+    product_display_id: str,
+    payload: ProductAttributeBackfillRequest,
+    session: Session = Depends(get_session),
+):
+    selected_product = session.query(product).filter(product.display_id == product_display_id).first()
+    if selected_product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    if not payload.selections:
+        raise HTTPException(status_code=400, detail="At least one attribute selection is required")
+
+    now = datetime.now()
+    applied: list[dict] = []
+
+    for selection in payload.selections:
+        normalized_attr = selection.attribute_name.strip()
+        normalized_opt = selection.option_value.strip()
+
+        definition_row = (
+            session.query(attribute_definition)
+            .filter(attribute_definition.attribute_name.ilike(normalized_attr))
+            .first()
+        )
+        if definition_row is None:
+            raise HTTPException(status_code=404, detail=f"Attribute definition not found: {selection.attribute_name}")
+
+        option_row = (
+            session.query(attribute_option)
+            .filter(
+                attribute_option.attribute_definition_id == definition_row.id,
+                attribute_option.option_value.ilike(normalized_opt),
+            )
+            .first()
+        )
+        if option_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Option '{selection.option_value}' not found for attribute '{selection.attribute_name}'",
+            )
+
+        existing = (
+            session.query(product_attribute)
+            .filter(
+                product_attribute.product_id == selected_product.id,
+                product_attribute.attribute_definition_id == definition_row.id,
+            )
+            .first()
+        )
+
+        if existing is None:
+            session.add(
+                product_attribute(
+                    product_id=selected_product.id,
+                    attribute_definition_id=definition_row.id,
+                    attribute_option_id=option_row.id,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        elif payload.overwrite_existing and existing.attribute_option_id != option_row.id:
+            existing.attribute_option_id = option_row.id
+            existing.updated_at = now
+
+        applied.append(
+            {
+                "definition_id": definition_row.id,
+                "attribute_name": definition_row.attribute_name,
+                "option_id": option_row.id,
+                "option_value": option_row.option_value,
+            }
+        )
+
+    session.commit()
+
+    return {
+        "message": "Product attributes backfilled successfully",
+        "product_display_id": selected_product.display_id,
+        "applied": applied,
+    }
