@@ -20,6 +20,10 @@ class ShopRegisterRequest(BaseModel):
     address: str = Field(..., min_length=3, max_length=500)
     phone_number: str = Field(..., min_length=7, max_length=20)
     shop_logo_url: str = Field(..., min_length=3, max_length=1000)
+    website_url: str | None = Field(default=None, max_length=255)
+    youtube_url: str | None = Field(default=None, max_length=255)
+    instagram_url: str | None = Field(default=None, max_length=255)
+    facebook_url: str | None = Field(default=None, max_length=255)
 
 
 class ShopLoginRequest(BaseModel):
@@ -81,6 +85,10 @@ def shop_register(
     year_established: int = Form(...),
     address: str = Form(...),
     phone_number: str = Form(...),
+    website_url: str | None = Form(default=None),
+    youtube_url: str | None = Form(default=None),
+    instagram_url: str | None = Form(default=None),
+    facebook_url: str | None = Form(default=None),
     shop_logo: UploadFile = File(...),
     session: Session = Depends(get_session),
 ):
@@ -143,6 +151,10 @@ def shop_register(
         year_established=year_established,
         address=address,
         phone_number=phone_number,
+        website_url=website_url.strip() if website_url else None,
+        youtube_url=youtube_url.strip() if youtube_url else None,
+        instagram_url=instagram_url.strip() if instagram_url else None,
+        facebook_url=facebook_url.strip() if facebook_url else None,
         shop_logo_url=logo_path,
         display_id=str(uuid.uuid4().hex)[:8],
         created_at=now,
