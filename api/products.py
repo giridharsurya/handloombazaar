@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from starlette.datastructures import UploadFile
 from pathlib import Path
 import shutil
-from sqlalchemy import and_, exists, select
+from sqlalchemy import and_, exists, select, func
 from sqlalchemy.orm import Session
 
 from db.database import get_session
@@ -201,9 +201,10 @@ def _serialize_listing_product(session: Session, item: product):
 def _serialize_product_detail(session: Session, item: product):
     shop_row = session.query(shop).filter(shop.id == item.shop_id).first()
 
-    group_count = 1
+    group_count = 0
     if item.product_group_id is not None:
-        group_count = (
+        # Count all products in the group, then subtract 1 (the main product itself)
+        total_in_group = (
             session.query(product)
             .filter(
                 product.shop_id == item.shop_id,
@@ -211,6 +212,8 @@ def _serialize_product_detail(session: Session, item: product):
             )
             .count()
         )
+        # group_count should be the number of variants (excluding the main product)
+        group_count = max(0, total_in_group - 1)
 
     images = (
         session.query(product_image)
@@ -539,9 +542,14 @@ def get_product_variants(
     if selected_product is None:
         raise HTTPException(status_code=404, detail="Product not found")
 
+    # If the product doesn't have a group, it has no variants
+    if not selected_product.product_group_id:
+        return ProductVariantsResponse(success=True, message="Product variants retrieved successfully", data=[])
+
     vq = session.query(product).filter(
         product.product_group_id == selected_product.product_group_id,
         product.shop_id == selected_product.shop_id,
+        product.id != selected_product.id,  # Exclude the main product itself
     )
     if current_user is None or current_user.role == UserRole.USER:
         vq = vq.filter(product.is_active.is_(True))
@@ -556,6 +564,131 @@ def get_product_variants(
         items.append(ProductListItem(**row))
 
     return ProductVariantsResponse(success=True, message="Product variants retrieved successfully", data=items)
+
+
+class UpdateVariantsRequest(BaseModel):
+    variant_display_ids: List[str]  # List of product display_ids to set as variants
+
+
+@products_router.post("/{product_id}/update-variants", response_model=ProductDetailResponse)
+async def update_product_variants(
+    product_id: str,
+    payload: UpdateVariantsRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """Update product variants. Creates product group if needed."""
+    current_user: Optional[UserModel] = getattr(request.state, "current_user", None)
+
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    # Get the main product
+    main_product = session.query(product).filter(product.display_id == product_id).first()
+    if not main_product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    # Authorization check
+    if current_user.role == UserRole.SHOP_OWNER:
+        owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if not owner_shop or owner_shop.id != main_product.shop_id:
+            raise HTTPException(status_code=403, detail="Not authorized to update this product")
+    elif current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Insufficient privileges")
+
+    now = datetime.now()
+
+    # Check if main product already has a group
+    if not main_product.product_group_id:
+        # Create a new product group for this shop
+        new_group = product_group(
+            shop_id=main_product.shop_id,
+            created_at=now,
+            updated_at=now,
+            is_active=True,
+        )
+        session.add(new_group)
+        session.flush()  # Flush to get the auto-generated id
+        group_id = new_group.id
+    else:
+        group_id = main_product.product_group_id
+
+    # Update main product to have this group
+    main_product.product_group_id = group_id
+    main_product.updated_at = now
+
+    # Get all products to update (both main and variants)
+    product_display_ids_set = set(payload.variant_display_ids)
+    product_display_ids_set.add(product_id)  # Include main product
+
+    # Get current variants before update (for cleanup)
+    current_variants = (
+        session.query(product).filter(
+            product.product_group_id == group_id,
+            product.shop_id == main_product.shop_id,
+        )
+    ).all()
+    current_variant_ids = {p.display_id for p in current_variants}
+
+    # Update selected products to have this group_id
+    for display_id in product_display_ids_set:
+        p = session.query(product).filter(product.display_id == display_id).first()
+        if p and p.shop_id == main_product.shop_id:
+            p.product_group_id = group_id
+            p.updated_at = now
+
+    # Remove products that are no longer variants (set to null)
+    for display_id in current_variant_ids:
+        if display_id not in product_display_ids_set:
+            p = session.query(product).filter(product.display_id == display_id).first()
+            if p:
+                p.product_group_id = None
+                p.updated_at = now
+
+    session.add(main_product)
+    session.commit()
+
+    # Clean up empty product groups (groups with no products)
+    try:
+        empty_groups = (
+            session.query(product_group.id)
+            .filter(product_group.shop_id == main_product.shop_id)
+            .outerjoin(product, (product_group.id == product.product_group_id) & (product_group.shop_id == product.shop_id))
+            .group_by(product_group.id)
+            .having(func.count(product.id) == 0)
+            .all()
+        )
+
+        for (empty_group_id,) in empty_groups:
+            session.query(product_group).filter(product_group.id == empty_group_id).delete(synchronize_session=False)
+
+        if empty_groups:
+            session.commit()
+    except Exception:
+        session.rollback()
+
+    session.refresh(main_product)
+
+    detail = _serialize_product_detail(session, main_product)
+    product_model = ProductDetail(
+        display_id=detail["display_id"],
+        name=detail["name"],
+        description=detail.get("description"),
+        price=detail["price"],
+        discount_price=detail.get("discount_price"),
+        stock_quantity=detail.get("stock_quantity"),
+        product_group_id=detail.get("product_group_id"),
+        group_product_count=detail.get("group_product_count", 1),
+        video_url=detail.get("video_url"),
+        created_at=detail.get("created_at"),
+        updated_at=detail.get("updated_at"),
+        is_active=detail.get("is_active"),
+        shop=ShopSummary(**detail.get("shop", {})),
+        images=detail.get("images", []),
+        attributes=[ProductAttributeItem(**a) for a in detail.get("attributes", [])],
+    )
+
+    return ProductDetailResponse(success=True, message="Variants updated successfully", product=product_model)
 
 
 @products_router.put("/{product_id}", response_model=ProductDetailResponse)
@@ -645,13 +778,24 @@ async def update_product(
                 except Exception:
                     raise HTTPException(status_code=422, detail="Invalid product_group_id value")
 
+                # Check if group exists; if not, create it
                 group_row = (
                     session.query(product_group)
                     .filter(product_group.id == parsed_group_id, product_group.shop_id == target_product.shop_id)
                     .first()
                 )
                 if not group_row:
-                    raise HTTPException(status_code=400, detail="Product group not found for this shop")
+                    # Auto-create the product group
+                    group_row = product_group(
+                        id=parsed_group_id,
+                        shop_id=target_product.shop_id,
+                        created_at=now,
+                        updated_at=now,
+                        is_active=True,
+                    )
+                    session.add(group_row)
+                    session.flush()
+                
                 target_product.product_group_id = parsed_group_id
 
         if "is_active" in form:
@@ -774,13 +918,24 @@ async def update_product(
             elif not isinstance(incoming_group_id, int):
                 raise HTTPException(status_code=422, detail="product_group_id must be an integer")
             else:
+                # Check if group exists; if not, create it
                 group_row = (
                     session.query(product_group)
                     .filter(product_group.id == incoming_group_id, product_group.shop_id == target_product.shop_id)
                     .first()
                 )
                 if not group_row:
-                    raise HTTPException(status_code=400, detail="Product group not found for this shop")
+                    # Auto-create the product group
+                    group_row = product_group(
+                        id=incoming_group_id,
+                        shop_id=target_product.shop_id,
+                        created_at=now,
+                        updated_at=now,
+                        is_active=True,
+                    )
+                    session.add(group_row)
+                    session.flush()
+                
                 target_product.product_group_id = incoming_group_id
 
         if "is_active" in body:
@@ -897,6 +1052,29 @@ async def update_product(
     target_product.updated_at = now
     session.add(target_product)
     session.commit()
+    session.refresh(target_product)
+    
+    # Clean up empty product groups (groups with no products) - only in this shop
+    try:
+        # Find all product groups in this shop that have no associated products
+        empty_groups = (
+            session.query(product_group.id)
+            .filter(product_group.shop_id == target_product.shop_id)
+            .outerjoin(product, (product_group.id == product.product_group_id) & (product_group.shop_id == product.shop_id))
+            .group_by(product_group.id)
+            .having(func.count(product.id) == 0)
+            .all()
+        )
+        
+        for (group_id,) in empty_groups:
+            session.query(product_group).filter(product_group.id == group_id).delete(synchronize_session=False)
+        
+        if empty_groups:
+            session.commit()
+    except Exception:
+        # If cleanup fails, continue anyway - it's not critical
+        session.rollback()
+    
     session.refresh(target_product)
 
     detail = _serialize_product_detail(session, target_product)
