@@ -68,6 +68,7 @@ class shop(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     year_established: Mapped[int] = mapped_column(Integer, nullable=False)
     address: Mapped[str] = mapped_column(String(500), nullable=False)
+    city: Mapped[str] = mapped_column(String(120), nullable=True)
     phone_number: Mapped[str] = mapped_column(String(20), nullable=False)
     email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     website_url: Mapped[str] = mapped_column(String(255), nullable=True)
@@ -108,6 +109,26 @@ class collection(Base):
     created_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class announcement_banner(Base):
+    __tablename__ = "announcement_banners"
+    __table_args__ = (
+        UniqueConstraint("collection_id", "shop_id", name="uq_announcement_collection_shop"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    display_id: Mapped[str] = mapped_column(String(8), unique=True, nullable=False, default=lambda: str(uuid.uuid4().hex)[:8])
+    collection_id: Mapped[int] = mapped_column(Integer, ForeignKey("collections.id", ondelete="CASCADE"), nullable=False)
+    # Null for system banner, set for shop-specific banner
+    shop_id: Mapped[int] = mapped_column(Integer, ForeignKey("shops.id", ondelete="CASCADE"), nullable=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    subtitle: Mapped[str] = mapped_column(String(500), nullable=True)
+    background_color: Mapped[str] = mapped_column(String(20), nullable=False, default="#F43F5E")
+    text_color: Mapped[str] = mapped_column(String(20), nullable=False, default="#FFFFFF")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
 
 class collection_product(Base):
     __tablename__ = "collection_products"

@@ -24,6 +24,7 @@ class ShopDetailResponse(ShopStatusResponse):
     description: str | None
     email: str
     address: str
+    city: str | None
     phone_number: str
     year_established: int
     website_url: str | None
@@ -37,6 +38,7 @@ class ShopUpdateRequest(BaseModel):
     email: EmailStr | None = None
     year_established: int | None = Field(default=None, ge=1800, le=2100)
     address: str | None = Field(default=None, min_length=3, max_length=500)
+    city: str | None = Field(default=None, min_length=2, max_length=120)
     phone_number: str | None = Field(default=None, min_length=7, max_length=20)
     website_url: str | None = Field(default=None, max_length=255)
     youtube_url: str | None = Field(default=None, max_length=255)
@@ -54,6 +56,7 @@ def _build_shop_detail_response(selected_shop: shop) -> ShopDetailResponse:
         description=getattr(selected_shop, "description", None),
         email=selected_shop.email,
         address=selected_shop.address,
+        city=selected_shop.city,
         phone_number=selected_shop.phone_number,
         year_established=selected_shop.year_established,
         website_url=selected_shop.website_url,
@@ -153,6 +156,10 @@ def update_shop_details(
         if payload.address is None:
             raise HTTPException(status_code=400, detail="Address cannot be null")
         selected_shop.address = payload.address.strip()
+    if "city" in provided_fields:
+        if payload.city is None:
+            raise HTTPException(status_code=400, detail="City cannot be null")
+        selected_shop.city = payload.city.strip()
     if "phone_number" in provided_fields:
         if payload.phone_number is None:
             raise HTTPException(status_code=400, detail="Phone number cannot be null")

@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Literal
 import json
 from pydantic import BaseModel
 
@@ -37,6 +37,7 @@ class ProductListItem(BaseModel):
     shop_logo_url: str
     price: int
     discount_price: int | None
+    stock_quantity: int
     is_active: bool
     created_at: datetime
     updated_at: datetime
@@ -85,6 +86,7 @@ class ShopSummary(BaseModel):
     email: str
     phone_number: str
     address: str
+    city: Optional[str] = None
     website_url: Optional[str] = None
     youtube_url: Optional[str] = None
     instagram_url: Optional[str] = None
@@ -158,6 +160,43 @@ class ProductUpdateRequest(BaseModel):
     primary_image_index: Optional[int] = None
 
 
+class BulkAttributeUpdateItem(BaseModel):
+    definition_id: int
+    option_id: Optional[int] = None
+    remove: bool = False
+
+
+class BulkUpdateProductAttributesRequest(BaseModel):
+    product_display_ids: List[str]
+    updates: List[BulkAttributeUpdateItem]
+
+
+class BulkUpdateProductAttributesResponse(BaseModel):
+    success: bool
+    message: str
+    updated_count: int
+
+
+class BulkProductActionRequest(BaseModel):
+    product_display_ids: List[str]
+    action: Literal[
+        "set_active",
+        "set_inactive",
+        "change_price_percent",
+        "set_discount_percent",
+        "delete_products",
+        "set_quantity",
+    ]
+    percentage: Optional[float] = None
+    quantity: Optional[int] = None
+
+
+class BulkProductActionResponse(BaseModel):
+    success: bool
+    message: str
+    affected_count: int
+
+
 def _serialize_listing_product(session: Session, item: product):
     shop_row = session.query(shop).filter(shop.id == item.shop_id).first()
     primary_image = (
@@ -186,6 +225,7 @@ def _serialize_listing_product(session: Session, item: product):
         "updated_at": item.updated_at,
         "price": item.price,
         "discount_price": item.discount_price,
+        "stock_quantity": item.stock_quantity,
         "is_active": item.is_active,
         "attributes": [
             {
@@ -253,6 +293,7 @@ def _serialize_product_detail(session: Session, item: product):
             "email": shop_row.email,
             "phone_number": shop_row.phone_number,
             "address": shop_row.address,
+            "city": shop_row.city,
             "website_url": shop_row.website_url,
             "youtube_url": shop_row.youtube_url,
             "instagram_url": shop_row.instagram_url,
@@ -330,7 +371,15 @@ def get_products(
 
     # base query depends on role
     if current_user is None:
-        base_query = session.query(product).filter(product.is_active.is_(True))
+        base_query = session.query(product).filter(product.is_active.is_(True), product.stock_quantity > 0)
+        if shop_display_id is not None:
+            shop_row = session.query(shop).filter(shop.display_id == shop_display_id).first()
+            if not shop_row:
+                return ProductsResponse(success=True, message="Products retrieved successfully", data=ProductsResponseData(page=page, page_size=page_size, total_count=0, has_next=False, items=[]))
+            base_query = base_query.filter(product.shop_id == shop_row.id)
+    elif current_user.role == UserRole.USER:
+        # authenticated public users should follow public visibility rules
+        base_query = session.query(product).filter(product.is_active.is_(True), product.stock_quantity > 0)
         if shop_display_id is not None:
             shop_row = session.query(shop).filter(shop.display_id == shop_display_id).first()
             if not shop_row:
@@ -345,7 +394,7 @@ def get_products(
         if shop_display_id is not None and shop_display_id != vendor_shop_display_id:
             raise HTTPException(status_code=403, detail="Not authorized for requested shop")
         base_query = session.query(product).filter(product.shop_id == shop_row.id)
-    else:
+    elif current_user.role == UserRole.ADMIN:
         # admin: full access
         base_query = session.query(product)
         if shop_display_id is not None:
@@ -353,6 +402,8 @@ def get_products(
             if not shop_row:
                 return ProductsResponse(success=True, message="Products retrieved successfully", data=ProductsResponseData(page=page, page_size=page_size, total_count=0, has_next=False, items=[]))
             base_query = base_query.filter(product.shop_id == shop_row.id)
+    else:
+        raise HTTPException(status_code=403, detail="Invalid role")
 
     if search:
         base_query = base_query.filter(product.name.ilike(f"%{search.strip()}%"))
@@ -564,6 +615,241 @@ def get_product_variants(
         items.append(ProductListItem(**row))
 
     return ProductVariantsResponse(success=True, message="Product variants retrieved successfully", data=items)
+
+
+@products_router.post("/bulk-update-attributes", response_model=BulkUpdateProductAttributesResponse)
+async def bulk_update_product_attributes(
+    payload: BulkUpdateProductAttributesRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    current_user: Optional[UserModel] = getattr(request.state, "current_user", None)
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    product_ids = list(dict.fromkeys([str(pid).strip() for pid in payload.product_display_ids if str(pid).strip()]))
+    if not product_ids:
+        raise HTTPException(status_code=422, detail="At least one product is required")
+
+    if not payload.updates:
+        raise HTTPException(status_code=422, detail="At least one attribute update is required")
+
+    target_products = session.query(product).filter(product.display_id.in_(product_ids)).all()
+    if len(target_products) != len(product_ids):
+        raise HTTPException(status_code=404, detail="One or more products were not found")
+
+    shop_ids = {p.shop_id for p in target_products}
+    if len(shop_ids) != 1:
+        raise HTTPException(status_code=400, detail="Selected products must belong to the same shop")
+    target_shop_id = next(iter(shop_ids))
+
+    if current_user.role == UserRole.SHOP_OWNER:
+        owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if not owner_shop or owner_shop.id != target_shop_id:
+            raise HTTPException(status_code=403, detail="Not authorized to update products from this shop")
+    elif current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Insufficient privileges")
+
+    normalized: dict[int, dict] = {}
+    for item in payload.updates:
+        definition_id = int(item.definition_id)
+        if item.remove:
+            normalized[definition_id] = {"remove": True, "option_id": None}
+            continue
+        if item.option_id is None:
+            raise HTTPException(status_code=422, detail=f"option_id required for definition {definition_id}")
+        normalized[definition_id] = {"remove": False, "option_id": int(item.option_id)}
+
+    definition_ids = list(normalized.keys())
+    option_ids = [v["option_id"] for v in normalized.values() if not v["remove"] and v["option_id"] is not None]
+
+    defs = session.query(attribute_definition).filter(attribute_definition.id.in_(definition_ids)).all()
+    def_map = {d.id: d for d in defs}
+    missing_defs = [d for d in definition_ids if d not in def_map]
+    if missing_defs:
+        raise HTTPException(status_code=400, detail=f"Attribute definitions not found: {missing_defs}")
+
+    options = []
+    if option_ids:
+        options = session.query(attribute_option).filter(attribute_option.id.in_(option_ids)).all()
+    option_map = {o.id: o for o in options}
+
+    for definition_id, op in normalized.items():
+        if op["remove"]:
+            continue
+        option_id = op["option_id"]
+        option_row = option_map.get(option_id)
+        if option_row is None:
+            raise HTTPException(status_code=400, detail=f"Attribute option not found: {option_id}")
+        if option_row.attribute_definition_id != definition_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Attribute option {option_id} does not belong to definition {definition_id}",
+            )
+
+    now = datetime.now()
+
+    for prod in target_products:
+        existing_rows = (
+            session.query(product_attribute)
+            .filter(
+                product_attribute.product_id == prod.id,
+                product_attribute.attribute_definition_id.in_(definition_ids),
+            )
+            .all()
+        )
+        existing_by_def = {row.attribute_definition_id: row for row in existing_rows}
+
+        for definition_id, op in normalized.items():
+            if op["remove"]:
+                existing = existing_by_def.get(definition_id)
+                if existing:
+                    session.delete(existing)
+                continue
+
+            option_id = op["option_id"]
+            existing = existing_by_def.get(definition_id)
+            if existing:
+                existing.attribute_option_id = option_id
+                existing.updated_at = now
+                session.add(existing)
+            else:
+                session.add(
+                    product_attribute(
+                        product_id=prod.id,
+                        attribute_definition_id=definition_id,
+                        attribute_option_id=option_id,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+        prod.updated_at = now
+        session.add(prod)
+
+    session.commit()
+
+    return BulkUpdateProductAttributesResponse(
+        success=True,
+        message="Product attributes updated successfully",
+        updated_count=len(target_products),
+    )
+
+
+@products_router.post("/bulk-product-action", response_model=BulkProductActionResponse)
+async def bulk_product_action(
+    payload: BulkProductActionRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    current_user: Optional[UserModel] = getattr(request.state, "current_user", None)
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    product_ids = list(dict.fromkeys([str(pid).strip() for pid in payload.product_display_ids if str(pid).strip()]))
+    if not product_ids:
+        raise HTTPException(status_code=422, detail="At least one product is required")
+
+    target_products = session.query(product).filter(product.display_id.in_(product_ids)).all()
+    if len(target_products) != len(product_ids):
+        raise HTTPException(status_code=404, detail="One or more products were not found")
+
+    shop_ids = {p.shop_id for p in target_products}
+    if len(shop_ids) != 1:
+        raise HTTPException(status_code=400, detail="Selected products must belong to the same shop")
+    target_shop_id = next(iter(shop_ids))
+
+    if current_user.role == UserRole.SHOP_OWNER:
+        owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if not owner_shop or owner_shop.id != target_shop_id:
+            raise HTTPException(status_code=403, detail="Not authorized to update products from this shop")
+    elif current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Insufficient privileges")
+
+    now = datetime.now()
+    affected_count = len(target_products)
+
+    if payload.action == "set_active":
+        for p in target_products:
+            p.is_active = True
+            p.updated_at = now
+            session.add(p)
+
+    elif payload.action == "set_inactive":
+        for p in target_products:
+            p.is_active = False
+            p.updated_at = now
+            session.add(p)
+
+    elif payload.action == "change_price_percent":
+        if payload.percentage is None:
+            raise HTTPException(status_code=422, detail="percentage is required for change_price_percent")
+        if payload.percentage < -100:
+            raise HTTPException(status_code=422, detail="percentage must be greater than or equal to -100")
+
+        ratio = (100.0 + payload.percentage) / 100.0
+        for p in target_products:
+            p.price = max(0, int(round(p.price * ratio)))
+            if p.discount_price is not None and p.discount_price > p.price:
+                p.discount_price = p.price
+            p.updated_at = now
+            session.add(p)
+
+    elif payload.action == "set_discount_percent":
+        if payload.percentage is None:
+            raise HTTPException(status_code=422, detail="percentage is required for set_discount_percent")
+        if payload.percentage < 0 or payload.percentage > 100:
+            raise HTTPException(status_code=422, detail="percentage must be between 0 and 100")
+
+        ratio = (100.0 - payload.percentage) / 100.0
+        for p in target_products:
+            next_discount = int(round(p.price * ratio))
+            next_discount = max(0, min(next_discount, p.price))
+            p.discount_price = next_discount
+            p.updated_at = now
+            session.add(p)
+
+    elif payload.action == "set_quantity":
+        if payload.quantity is None:
+            raise HTTPException(status_code=422, detail="quantity is required for set_quantity")
+        if payload.quantity < 0:
+            raise HTTPException(status_code=422, detail="quantity must be non-negative")
+
+        for p in target_products:
+            p.stock_quantity = payload.quantity
+            p.updated_at = now
+            session.add(p)
+
+    elif payload.action == "delete_products":
+        for p in target_products:
+            session.delete(p)
+
+    session.commit()
+
+    # Cleanup empty groups in that shop after bulk operations (especially delete)
+    try:
+        empty_groups = (
+            session.query(product_group.id)
+            .filter(product_group.shop_id == target_shop_id)
+            .outerjoin(product, (product_group.id == product.product_group_id) & (product_group.shop_id == product.shop_id))
+            .group_by(product_group.id)
+            .having(func.count(product.id) == 0)
+            .all()
+        )
+
+        for (group_id,) in empty_groups:
+            session.query(product_group).filter(product_group.id == group_id).delete(synchronize_session=False)
+
+        if empty_groups:
+            session.commit()
+    except Exception:
+        session.rollback()
+
+    return BulkProductActionResponse(
+        success=True,
+        message="Bulk product action completed successfully",
+        affected_count=affected_count,
+    )
 
 
 class UpdateVariantsRequest(BaseModel):

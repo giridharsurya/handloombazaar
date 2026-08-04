@@ -18,6 +18,7 @@ class ShopRegisterRequest(BaseModel):
     password: str = Field(..., min_length=6)
     year_established: int = Field(..., ge=1800, le=2100)
     address: str = Field(..., min_length=3, max_length=500)
+    city: str = Field(..., min_length=2, max_length=120)
     phone_number: str = Field(..., min_length=7, max_length=20)
     shop_logo_url: str = Field(..., min_length=3, max_length=1000)
     website_url: str | None = Field(default=None, max_length=255)
@@ -84,6 +85,7 @@ def shop_register(
     password: str = Form(...),
     year_established: int = Form(...),
     address: str = Form(...),
+    city: str = Form(...),
     phone_number: str = Form(...),
     website_url: str | None = Form(default=None),
     youtube_url: str | None = Form(default=None),
@@ -150,6 +152,7 @@ def shop_register(
         email=email,
         year_established=year_established,
         address=address,
+        city=city.strip(),
         phone_number=phone_number,
         website_url=website_url.strip() if website_url else None,
         youtube_url=youtube_url.strip() if youtube_url else None,
