@@ -1,3 +1,4 @@
+from collections import defaultdict
 from typing import Optional, List, Literal
 import json
 from pydantic import BaseModel
@@ -6,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from starlette.datastructures import UploadFile
 from pathlib import Path
 import shutil
-from sqlalchemy import and_, exists, select, func
+from sqlalchemy import and_, exists, func, select
 from sqlalchemy.orm import Session
 
 from db.database import get_session
@@ -350,6 +351,39 @@ def _apply_attribute_filters(base_query, attribute_filters: list[str]):
     return base_query
 
 
+def _apply_attribute_option_filters(base_query, attribute_option_ids: list[int], session: Session):
+    normalized_ids = sorted({int(v) for v in attribute_option_ids if isinstance(v, int) or str(v).isdigit()})
+    if not normalized_ids:
+        return base_query
+
+    option_rows = (
+        session.query(attribute_option.id, attribute_option.attribute_definition_id)
+        .filter(attribute_option.id.in_(normalized_ids), attribute_option.is_active.is_(True))
+        .all()
+    )
+    if not option_rows:
+        return base_query
+
+    options_by_definition: dict[int, set[int]] = defaultdict(set)
+    for option_id, definition_id in option_rows:
+        options_by_definition[int(definition_id)].add(int(option_id))
+
+    # AND across definitions, OR across selected options within each definition.
+    for definition_id, option_ids_for_definition in options_by_definition.items():
+        filter_exists = exists(
+            select(product_attribute.id).where(
+                and_(
+                    product_attribute.product_id == product.id,
+                    product_attribute.attribute_definition_id == definition_id,
+                    product_attribute.attribute_option_id.in_(list(option_ids_for_definition)),
+                )
+            )
+        )
+        base_query = base_query.filter(filter_exists)
+
+    return base_query
+
+
 @products_router.get("", response_model=ProductsResponse)
 def get_products(
     request: Request,
@@ -359,6 +393,10 @@ def get_products(
     shop_display_id: Optional[str] = Query(None),
     min_price: Optional[float] = Query(None, ge=0),
     max_price: Optional[float] = Query(None, ge=0),
+    attribute_option_ids: list[int] = Query(
+        default=[],
+        description="Repeat query param as attribute_option_ids=11&attribute_option_ids=24",
+    ),
     attribute_filters: list[str] = Query(
         default=[],
         description="Repeat query param as attribute_filters=Color:Red&attribute_filters=Size:M",
@@ -410,16 +448,17 @@ def get_products(
 
 
     if min_price is not None:
-        base_query = base_query.filter(product.price >= min_price)
+        base_query = base_query.filter(func.coalesce(product.discount_price, product.price) >= min_price)
 
     if max_price is not None:
-        base_query = base_query.filter(product.price <= max_price)
+        base_query = base_query.filter(func.coalesce(product.discount_price, product.price) <= max_price)
 
+    base_query = _apply_attribute_option_filters(base_query, attribute_option_ids, session)
     base_query = _apply_attribute_filters(base_query, attribute_filters)
 
     total_count = base_query.count()
     items = (
-        base_query.order_by(product.created_at.desc())
+        base_query.order_by(product.created_at.desc(), product.id.desc())
         .offset(offset)
         .limit(page_size)
         .all()
@@ -639,15 +678,18 @@ async def bulk_update_product_attributes(
         raise HTTPException(status_code=404, detail="One or more products were not found")
 
     shop_ids = {p.shop_id for p in target_products}
-    if len(shop_ids) != 1:
-        raise HTTPException(status_code=400, detail="Selected products must belong to the same shop")
-    target_shop_id = next(iter(shop_ids))
 
     if current_user.role == UserRole.SHOP_OWNER:
+        if len(shop_ids) != 1:
+            raise HTTPException(status_code=400, detail="Selected products must belong to the same shop")
+        target_shop_id = next(iter(shop_ids))
         owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
         if not owner_shop or owner_shop.id != target_shop_id:
             raise HTTPException(status_code=403, detail="Not authorized to update products from this shop")
-    elif current_user.role != UserRole.ADMIN:
+    elif current_user.role == UserRole.ADMIN:
+        # Admin may update attributes across multiple shops.
+        target_shop_id = None
+    else:
         raise HTTPException(status_code=403, detail="Insufficient privileges")
 
     normalized: dict[int, dict] = {}
@@ -755,15 +797,20 @@ async def bulk_product_action(
         raise HTTPException(status_code=404, detail="One or more products were not found")
 
     shop_ids = {p.shop_id for p in target_products}
-    if len(shop_ids) != 1:
-        raise HTTPException(status_code=400, detail="Selected products must belong to the same shop")
-    target_shop_id = next(iter(shop_ids))
+    target_shop_ids = shop_ids
 
     if current_user.role == UserRole.SHOP_OWNER:
+        if len(shop_ids) != 1:
+            raise HTTPException(status_code=400, detail="Selected products must belong to the same shop")
+        target_shop_id = next(iter(shop_ids))
         owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
         if not owner_shop or owner_shop.id != target_shop_id:
             raise HTTPException(status_code=403, detail="Not authorized to update products from this shop")
-    elif current_user.role != UserRole.ADMIN:
+        target_shop_ids = {target_shop_id}
+    elif current_user.role == UserRole.ADMIN:
+        # Admin may act across products from multiple shops.
+        target_shop_ids = shop_ids
+    else:
         raise HTTPException(status_code=403, detail="Insufficient privileges")
 
     now = datetime.now()

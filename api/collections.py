@@ -1,8 +1,10 @@
+from collections import defaultdict
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import and_, exists, func, select
 from sqlalchemy.orm import Session
 
 from db.database import get_session
@@ -17,7 +19,9 @@ from db.db_models import (
     attribute_option,
     attribute_definition,
     product,
+    product_attribute,
 )
+from api.products import _serialize_listing_product
 
 
 router = APIRouter(prefix="/api/collections", tags=["Collections"])
@@ -590,8 +594,54 @@ def update_constraints(collection_id: int, payload: ConstraintsUpdateRequest, re
     return {"message": "Constraints updated"}
 
 
+def _apply_attribute_option_filters(base_query, attribute_option_ids: list[int], session: Session):
+    normalized_ids = sorted({int(v) for v in attribute_option_ids if isinstance(v, int) or str(v).isdigit()})
+    if not normalized_ids:
+        return base_query
+
+    option_rows = (
+        session.query(attribute_option.id, attribute_option.attribute_definition_id)
+        .filter(attribute_option.id.in_(normalized_ids), attribute_option.is_active.is_(True))
+        .all()
+    )
+    if not option_rows:
+        return base_query
+
+    options_by_definition: dict[int, set[int]] = defaultdict(set)
+    for option_id, definition_id in option_rows:
+        options_by_definition[int(definition_id)].add(int(option_id))
+
+    for definition_id, option_ids_for_definition in options_by_definition.items():
+        filter_exists = exists(
+            select(product_attribute.id).where(
+                and_(
+                    product_attribute.product_id == product.id,
+                    product_attribute.attribute_definition_id == definition_id,
+                    product_attribute.attribute_option_id.in_(list(option_ids_for_definition)),
+                )
+            )
+        )
+        base_query = base_query.filter(filter_exists)
+
+    return base_query
+
+
 @router.get("/{collection_id}/products")
-def get_products(collection_id: int, request: Request, session: Session = Depends(get_session)):
+def get_products(
+    collection_id: int,
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    search: Optional[str] = Query(None),
+    min_price: Optional[float] = Query(None, ge=0),
+    max_price: Optional[float] = Query(None, ge=0),
+    attribute_option_ids: list[int] = Query(default=[]),
+    mode: Literal["view", "add", "delete"] = Query("view"),
+    source_collection_id: Optional[int] = Query(None),
+    source_shop_display_id: Optional[str] = Query(None),
+    shop_display_id: Optional[str] = Query(None),
+    session: Session = Depends(get_session),
+):
     c = session.query(collection).filter(collection.id == collection_id).first()
     if c is None:
         raise HTTPException(status_code=404, detail="Collection not found")
@@ -611,8 +661,6 @@ def get_products(collection_id: int, request: Request, session: Session = Depend
     shop_display_ids = [s.shop_display_id for s in shops if s.shop_display_id]
     is_shop_bound = len(sc_links) > 0
     owned_sc_rows = []
-    owned_sc_rows = []
-    owned_sc_rows = []
 
     # determine requester and role
     current_user = getattr(request.state, "current_user", None)
@@ -623,10 +671,12 @@ def get_products(collection_id: int, request: Request, session: Session = Depend
         role_val = role
     is_admin = str(role_val).lower() == "admin" if role_val else False
 
-    # Public (unauthenticated) rules:
+    # Public view rules:
     # - may retrieve active system collections
-    # - may retrieve shop collections (only if collection is active)
+    # - may retrieve shop collections only if collection is active
     if current_user is None and not is_admin:
+        if mode != "view":
+            raise HTTPException(status_code=401, detail="Authentication required for this collection mode")
         if not c.is_active:
             raise HTTPException(status_code=403, detail="Not authorized to view this collection products")
 
@@ -662,68 +712,220 @@ def get_products(collection_id: int, request: Request, session: Session = Depend
                 if vendor_shop_display_id not in shop_display_ids:
                     raise HTTPException(status_code=403, detail="Not authorized to view this collection products")
 
-    # Admins may view everything; at this point request is authorized to query products
-    # Collect product ids from canonical collection_product rows
-    product_id_set = set()
-    try:
-        cp_rows = (
+        if mode in ("add", "delete") and vendor_shop_row is None:
+            raise HTTPException(status_code=403, detail="Not authorized for this collection mode")
+
+    # Build product membership set for current caller scope.
+    existing_product_ids: set[int] = set()
+    cp_rows = (
+        session.query(collection_product)
+        .filter(collection_product.collection_id == collection_id)
+        .all()
+    )
+    for r in cp_rows:
+        existing_product_ids.add(r.product_id)
+
+    sc_ids = [s.id for s in sc_links]
+    if sc_ids:
+        sc_query_ids = sc_ids
+        if current_user is not None and not is_admin and vendor_shop_row is not None:
+            sc_query_ids = [s.id for s in owned_sc_rows]
+
+        if sc_query_ids:
+            scp_rows = (
+                session.query(shop_collection_product)
+                .filter(shop_collection_product.shop_collection_id.in_(sc_query_ids))
+                .all()
+            )
+            for r in scp_rows:
+                existing_product_ids.add(r.product_id)
+
+    prod_q = session.query(product)
+    
+    # When in add/delete mode with a source collection, filter to products from that collection
+    if mode in ("add", "delete") and source_collection_id is not None:
+        source_product_ids: set[int] = set()
+        
+        # Get products from the source collection (collection_product table)
+        source_cp_rows = (
             session.query(collection_product)
-            .filter(collection_product.collection_id == collection_id)
-            .order_by(collection_product.created_at.desc())
+            .filter(collection_product.collection_id == source_collection_id)
             .all()
         )
-        for r in cp_rows:
-            product_id_set.add(r.product_id)
-    except Exception:
-        pass
+        for r in source_cp_rows:
+            source_product_ids.add(r.product_id)
+        
+        # Also get products from shop_collection links if source is a shop collection
+        source_sc_links = (
+            session.query(shop_collection)
+            .filter(shop_collection.collection_id == source_collection_id)
+            .all()
+        )
+        source_sc_ids = [s.id for s in source_sc_links]
+        if source_sc_ids:
+            source_scp_rows = (
+                session.query(shop_collection_product)
+                .filter(shop_collection_product.shop_collection_id.in_(source_sc_ids))
+                .all()
+            )
+            for r in source_scp_rows:
+                source_product_ids.add(r.product_id)
+        
+        # Filter to only products from source collection
+        if source_product_ids:
+            prod_q = prod_q.filter(product.id.in_(list(source_product_ids)))
+        else:
+            # If source collection has no products, return empty
+            empty = {
+                "page": page,
+                "page_size": page_size,
+                "total_count": 0,
+                "has_next": False,
+                "items": [],
+            }
+            return {
+                "success": True,
+                "message": "Collection products retrieved successfully",
+                "data": empty,
+            }
+    
+    # When in add/delete mode with a source shop, filter to products from that shop
+    if mode in ("add", "delete") and source_shop_display_id is not None:
+        source_shop_row = session.query(shop).filter(shop.display_id == source_shop_display_id).first()
+        if source_shop_row:
+            prod_q = prod_q.filter(product.shop_id == source_shop_row.id)
+        else:
+            # If source shop doesn't exist, return empty
+            empty = {
+                "page": page,
+                "page_size": page_size,
+                "total_count": 0,
+                "has_next": False,
+                "items": [],
+            }
+            return {
+                "success": True,
+                "message": "Collection products retrieved successfully",
+                "data": empty,
+            }
+    
+    # When fetching collection products for a specific shop view (e.g., ribbons),
+    # filter to only products from that shop
+    if shop_display_id is not None:
+        filter_shop_row = session.query(shop).filter(shop.display_id == shop_display_id).first()
+        if filter_shop_row:
+            prod_q = prod_q.filter(product.shop_id == filter_shop_row.id)
+        else:
+            # If shop doesn't exist, return empty
+            empty = {
+                "page": page,
+                "page_size": page_size,
+                "total_count": 0,
+                "has_next": False,
+                "items": [],
+            }
+            return {
+                "success": True,
+                "message": "Collection products retrieved successfully",
+                "data": empty,
+            }
+    
+    if mode in ("view", "delete"):
+        if not existing_product_ids:
+            empty = {
+                "page": page,
+                "page_size": page_size,
+                "total_count": 0,
+                "has_next": False,
+                "items": [],
+            }
+            return {
+                "success": True,
+                "message": "Collection products retrieved successfully",
+                "data": empty,
+            }
+        prod_q = prod_q.filter(product.id.in_(list(existing_product_ids)))
+    else:
+        # In add mode, exclude products already in the destination collection
+        if existing_product_ids:
+            prod_q = prod_q.filter(~product.id.in_(list(existing_product_ids)))
 
-    # Also collect members stored in shop_collection_product for any shop_collection links
-    try:
-        sc_rows = sc_links  # already queried above
-        sc_ids = [s.id for s in sc_rows]
-        if sc_ids:
-            # For non-admin vendors, restrict to their own shop_collection rows
-            if current_user is not None and not is_admin and vendor_shop_row:
-                owned_sc_ids = [s.id for s in owned_sc_rows]
-                sc_query_ids = owned_sc_ids
-            else:
-                sc_query_ids = sc_ids
+    # Vendors should only operate on their own products in system collection contexts.
+    if current_user is not None and not is_admin and vendor_shop_row is not None:
+        if not is_shop_bound:
+            prod_q = prod_q.filter(product.shop_id == vendor_shop_row.id)
 
-            if sc_query_ids:
-                scp_rows = (
-                    session.query(shop_collection_product)
-                    .filter(shop_collection_product.shop_collection_id.in_(sc_query_ids))
-                    .order_by(shop_collection_product.created_at.desc())
-                    .all()
+    # In add mode, enforce collection constraints server-side for eligibility.
+    if mode == "add":
+        if not is_shop_bound and shop_display_ids:
+            allowed_shop_rows = session.query(shop.id).filter(shop.display_id.in_(shop_display_ids)).all()
+            allowed_shop_ids = [row[0] for row in allowed_shop_rows]
+            if not allowed_shop_ids:
+                empty = {
+                    "page": page,
+                    "page_size": page_size,
+                    "total_count": 0,
+                    "has_next": False,
+                    "items": [],
+                }
+                return {
+                    "success": True,
+                    "message": "Collection products retrieved successfully",
+                    "data": empty,
+                }
+            prod_q = prod_q.filter(product.shop_id.in_(allowed_shop_ids))
+
+        required_option_rows = (
+            session.query(collection_attribute_option.attribute_definition_id, collection_attribute_option.attribute_option_id)
+            .filter(collection_attribute_option.collection_id == collection_id)
+            .all()
+        )
+        required_options_by_definition: dict[int, set[int]] = defaultdict(set)
+        for definition_id, option_id in required_option_rows:
+            required_options_by_definition[int(definition_id)].add(int(option_id))
+
+        for definition_id, option_ids_for_definition in required_options_by_definition.items():
+            required_exists = exists(
+                select(product_attribute.id).where(
+                    and_(
+                        product_attribute.product_id == product.id,
+                        product_attribute.attribute_definition_id == definition_id,
+                        product_attribute.attribute_option_id.in_(list(option_ids_for_definition)),
+                    )
                 )
-                for r in scp_rows:
-                    product_id_set.add(r.product_id)
-    except Exception:
-        pass
+            )
+            prod_q = prod_q.filter(required_exists)
 
-    if not product_id_set:
-        return {"items": []}
+    if search:
+        prod_q = prod_q.filter(product.name.ilike(f"%{search.strip()}%"))
+    if min_price is not None:
+        prod_q = prod_q.filter(func.coalesce(product.discount_price, product.price) >= min_price)
+    if max_price is not None:
+        prod_q = prod_q.filter(func.coalesce(product.discount_price, product.price) <= max_price)
 
-    # Base product query
-    prod_q = session.query(product).filter(product.id.in_(list(product_id_set)))
+    prod_q = _apply_attribute_option_filters(prod_q, attribute_option_ids, session)
 
-    # Vendors requesting system collections should only receive their own products
-    if current_user is not None and not is_admin:
-        if not is_shop_bound and vendor_shop_display_id:
-            # prefer product.shop_display_id if present, otherwise try joining via shop relationship
-            try:
-                prod_q = prod_q.filter(product.shop_display_id == vendor_shop_display_id)
-            except Exception:
-                # fallback: join shop table (if product has shop_id)
-                try:
-                    prod_q = prod_q.join(shop, product.shop_id == shop.id).filter(shop.display_id == vendor_shop_display_id)
-                except Exception:
-                    # if model doesn't support shop filtering, return empty set to be safe
-                    prod_q = prod_q.filter(False)
-
-    products = prod_q.all()
-
-    return {"items": [{"id": p.id, "display_id": p.display_id, "name": p.name} for p in products]}
+    total_count = prod_q.count()
+    offset = (page - 1) * page_size
+    rows = (
+        prod_q.order_by(product.created_at.desc(), product.id.desc())
+        .offset(offset)
+        .limit(page_size)
+        .all()
+    )
+    items = [_serialize_listing_product(session, p) for p in rows]
+    data = {
+        "page": page,
+        "page_size": page_size,
+        "total_count": total_count,
+        "has_next": (offset + page_size < total_count),
+        "items": items,
+    }
+    return {
+        "success": True,
+        "message": "Collection products retrieved successfully",
+        "data": data,
+    }
 
 
 @router.post("/{collection_id}/add")
@@ -794,6 +996,15 @@ def add_products(collection_id: int, payload: ProductsModifyRequest, request: Re
                 if vendor_shop_display_id not in shop_display_ids:
                     raise HTTPException(status_code=403, detail="Not authorized to add products to this collection")
 
+    required_option_rows = (
+        session.query(collection_attribute_option.attribute_definition_id, collection_attribute_option.attribute_option_id)
+        .filter(collection_attribute_option.collection_id == collection_id)
+        .all()
+    )
+    required_options_by_definition: dict[int, set[int]] = defaultdict(set)
+    for definition_id, option_id in required_option_rows:
+        required_options_by_definition[int(definition_id)].add(int(option_id))
+
     now = datetime.now()
     added = 0
     blocked_by_constraints = 0
@@ -817,6 +1028,26 @@ def add_products(collection_id: int, payload: ProductsModifyRequest, request: Re
                 product_shop_display_id = None
 
             if not product_shop_display_id or product_shop_display_id not in shop_display_ids:
+                blocked_by_constraints += 1
+                continue
+
+        # Enforce required-attributes constraints server-side for all callers.
+        if required_options_by_definition:
+            is_eligible = True
+            for definition_id, option_ids_for_definition in required_options_by_definition.items():
+                matches_required_option = (
+                    session.query(product_attribute.id)
+                    .filter(
+                        product_attribute.product_id == p.id,
+                        product_attribute.attribute_definition_id == definition_id,
+                        product_attribute.attribute_option_id.in_(list(option_ids_for_definition)),
+                    )
+                    .first()
+                )
+                if not matches_required_option:
+                    is_eligible = False
+                    break
+            if not is_eligible:
                 blocked_by_constraints += 1
                 continue
 
