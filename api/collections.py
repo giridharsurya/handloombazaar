@@ -57,7 +57,9 @@ class ConstraintsUpdateRequest(BaseModel):
 
 
 @router.get("")
-def list_collections(kind: Optional[str] = None, shop_display_id: Optional[str] = None, session: Session = Depends(get_session)):
+def list_collections(kind: Optional[str] = None, shop_display_id: Optional[str] = None, session: Session = Depends(get_session), request: Request = None):
+    current_user = getattr(request.state, "current_user", None)
+    is_public_request = current_user is None
     qs = session.query(collection)
     # Prefer explicit `kind` column on collection: 'system' or 'shop'.
     # If caller didn't provide a kind (admin page), default to system collections.
@@ -72,7 +74,10 @@ def list_collections(kind: Optional[str] = None, shop_display_id: Optional[str] 
         # system collections = entries in `collection` that do NOT have a shop binding
         # i.e., skip any collection that has a shop_collection referencing it
         subq = session.query(shop_collection.collection_id).distinct()
-        rows = session.query(collection).filter(~collection.id.in_(subq)).order_by(collection.created_at.desc()).all()
+        collection_query = session.query(collection).filter(~collection.id.in_(subq))
+        if is_public_request:
+            collection_query = collection_query.filter(collection.is_active.is_(True))
+        rows = collection_query.order_by(collection.created_at.desc()).all()
         for r in rows:
             item = {"id": r.id, "display_id": r.display_id, "name": r.name, "description": r.description, "is_active": r.is_active}
             # include linked constraint shops (collection_shops) when present
@@ -626,6 +631,14 @@ def _apply_attribute_option_filters(base_query, attribute_option_ids: list[int],
     return base_query
 
 
+def _apply_sort(base_query, sort_by: Literal["newest", "price-low", "price-high"]):
+    if sort_by == "price-low":
+        return base_query.order_by(func.coalesce(product.discount_price, product.price).asc(), product.id.desc())
+    if sort_by == "price-high":
+        return base_query.order_by(func.coalesce(product.discount_price, product.price).desc(), product.id.desc())
+    return base_query.order_by(product.created_at.desc(), product.id.desc())
+
+
 @router.get("/{collection_id}/products")
 def get_products(
     collection_id: int,
@@ -635,6 +648,7 @@ def get_products(
     search: Optional[str] = Query(None),
     min_price: Optional[float] = Query(None, ge=0),
     max_price: Optional[float] = Query(None, ge=0),
+    sort_by: Literal["newest", "price-low", "price-high"] = Query("newest"),
     attribute_option_ids: list[int] = Query(default=[]),
     mode: Literal["view", "add", "delete"] = Query("view"),
     source_collection_id: Optional[int] = Query(None),
@@ -845,6 +859,11 @@ def get_products(
                 "data": empty,
             }
         prod_q = prod_q.filter(product.id.in_(list(existing_product_ids)))
+
+        # Public collection views should only return active products.
+        # This keeps featured and other public collection pages from showing inactive listings.
+        if current_user is None:
+            prod_q = prod_q.filter(product.is_active.is_(True))
     else:
         # In add mode, exclude products already in the destination collection
         if existing_product_ids:
@@ -908,7 +927,7 @@ def get_products(
     total_count = prod_q.count()
     offset = (page - 1) * page_size
     rows = (
-        prod_q.order_by(product.created_at.desc(), product.id.desc())
+        _apply_sort(prod_q, sort_by)
         .offset(offset)
         .limit(page_size)
         .all()

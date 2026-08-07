@@ -384,6 +384,14 @@ def _apply_attribute_option_filters(base_query, attribute_option_ids: list[int],
     return base_query
 
 
+def _apply_sort(base_query, sort_by: Literal["newest", "price-low", "price-high"]):
+    if sort_by == "price-low":
+        return base_query.order_by(func.coalesce(product.discount_price, product.price).asc(), product.id.desc())
+    if sort_by == "price-high":
+        return base_query.order_by(func.coalesce(product.discount_price, product.price).desc(), product.id.desc())
+    return base_query.order_by(product.created_at.desc(), product.id.desc())
+
+
 @products_router.get("", response_model=ProductsResponse)
 def get_products(
     request: Request,
@@ -393,6 +401,7 @@ def get_products(
     shop_display_id: Optional[str] = Query(None),
     min_price: Optional[float] = Query(None, ge=0),
     max_price: Optional[float] = Query(None, ge=0),
+    sort_by: Literal["newest", "price-low", "price-high"] = Query("newest"),
     attribute_option_ids: list[int] = Query(
         default=[],
         description="Repeat query param as attribute_option_ids=11&attribute_option_ids=24",
@@ -458,7 +467,7 @@ def get_products(
 
     total_count = base_query.count()
     items = (
-        base_query.order_by(product.created_at.desc(), product.id.desc())
+        _apply_sort(base_query, sort_by)
         .offset(offset)
         .limit(page_size)
         .all()
