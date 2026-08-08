@@ -243,21 +243,29 @@ def shop_login(request: ShopLoginRequest, session: Session = Depends(get_session
 
 
 @auth_router.post("/shop/verify", response_model=TokenVerifyResponse)
-def verify_token_endpoint(token: str):
+def verify_token_endpoint(token: str, session: Session = Depends(get_session)):
     """Verify a shop token."""
 
     payload = verify_token(token)
-    if payload:
-        return TokenVerifyResponse(
-            valid=True,
-            shop_display_id=payload.get("shop_display_id"),
-            username=payload.get("username"),
-            role=payload.get("role"),
-        )
-    else:
-        return TokenVerifyResponse(
-            valid=False,
-            shop_display_id=None,
-            username=None,
-            role=None,
-        )
+    if not payload:
+        return TokenVerifyResponse(valid=False, shop_display_id=None, username=None, role=None)
+
+    username = payload.get("username") or payload.get("sub")
+    if not username:
+        return TokenVerifyResponse(valid=False, shop_display_id=None, username=None, role=None)
+
+    selected_user = session.query(user).filter(user.username == username).first()
+    if not selected_user:
+        return TokenVerifyResponse(valid=False, shop_display_id=None, username=None, role=None)
+
+    token_role = payload.get("role")
+    user_role = getattr(selected_user.role, "value", str(selected_user.role))
+    if token_role != user_role or not getattr(selected_user, "is_active", True):
+        return TokenVerifyResponse(valid=False, shop_display_id=None, username=None, role=None)
+
+    return TokenVerifyResponse(
+        valid=True,
+        shop_display_id=payload.get("shop_display_id"),
+        username=username,
+        role=token_role,
+    )

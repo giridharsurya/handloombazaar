@@ -3,11 +3,12 @@ from pathlib import Path
 import shutil
 import uuid
 
-from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile, File
+from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile, File, Response
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr, Field
 from db.database import get_session
 from db.db_models import shop, UserRole
+from api.analytics import track_entity_view
 
 shops_router = APIRouter(prefix="/api/shops", tags=["shops"])
 
@@ -99,7 +100,7 @@ def shop_status(display_id: str, session: Session = Depends(get_session)):
 
 
 @shops_router.get("/{display_id}", response_model=ShopDetailResponse)
-def shop_detail(display_id: str, session: Session = Depends(get_session)):
+def shop_detail(display_id: str, request: Request, response: Response, session: Session = Depends(get_session)):
     selected_shop = (
         session.query(shop)
         .filter(
@@ -112,6 +113,7 @@ def shop_detail(display_id: str, session: Session = Depends(get_session)):
     if selected_shop is None:
         raise HTTPException(status_code=404, detail="Shop not found")
 
+    track_entity_view(session, request, response, "shop", selected_shop.id)
     return _build_shop_detail_response(selected_shop)
 
 

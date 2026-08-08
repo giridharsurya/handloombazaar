@@ -64,6 +64,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Visitor-Token"],
 )
 
 
@@ -107,7 +108,11 @@ async def auth_middleware(request: Request, call_next):
                 username = payload.get("username") or payload.get("sub")
                 if username:
                     u = session.query(UserModel).filter(UserModel.username == username).first()
-                    request.state.current_user = u
+                    if u is not None:
+                        token_role = payload.get("role")
+                        user_role = getattr(u.role, "value", str(u.role))
+                        if token_role == user_role and getattr(u, "is_active", True):
+                            request.state.current_user = u
             finally:
                 if session:
                     session.close()

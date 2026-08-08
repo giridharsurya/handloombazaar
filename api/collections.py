@@ -2,7 +2,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import List, Optional, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, exists, func, select
 from sqlalchemy.orm import Session
@@ -22,6 +22,7 @@ from db.db_models import (
     product_attribute,
 )
 from api.products import _serialize_listing_product
+from api.analytics import track_entity_view
 
 
 router = APIRouter(prefix="/api/collections", tags=["Collections"])
@@ -643,6 +644,7 @@ def _apply_sort(base_query, sort_by: Literal["newest", "price-low", "price-high"
 def get_products(
     collection_id: int,
     request: Request,
+    response: Response,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     search: Optional[str] = Query(None),
@@ -651,6 +653,7 @@ def get_products(
     sort_by: Literal["newest", "price-low", "price-high"] = Query("newest"),
     attribute_option_ids: list[int] = Query(default=[]),
     mode: Literal["view", "add", "delete"] = Query("view"),
+    track_view: bool = Query(False),
     source_collection_id: Optional[int] = Query(None),
     source_shop_display_id: Optional[str] = Query(None),
     shop_display_id: Optional[str] = Query(None),
@@ -933,6 +936,10 @@ def get_products(
         .all()
     )
     items = [_serialize_listing_product(session, p) for p in rows]
+
+    if track_view:
+        track_entity_view(session, request, response, "collection", collection_id)
+
     data = {
         "page": page,
         "page_size": page_size,

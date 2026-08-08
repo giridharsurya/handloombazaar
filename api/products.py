@@ -3,7 +3,7 @@ from typing import Optional, List, Literal
 import json
 from pydantic import BaseModel
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from starlette.datastructures import UploadFile
 from pathlib import Path
 import shutil
@@ -22,6 +22,7 @@ from db.db_models import (
     user as UserModel,
     UserRole,
 )
+from api.analytics import track_entity_view
 import uuid
 from datetime import datetime
 
@@ -395,10 +396,12 @@ def _apply_sort(base_query, sort_by: Literal["newest", "price-low", "price-high"
 @products_router.get("", response_model=ProductsResponse)
 def get_products(
     request: Request,
+    response: Response,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     search: Optional[str] = Query(None),
     shop_display_id: Optional[str] = Query(None),
+    track_shop_view: bool = Query(False),
     min_price: Optional[float] = Query(None, ge=0),
     max_price: Optional[float] = Query(None, ge=0),
     sort_by: Literal["newest", "price-low", "price-high"] = Query("newest"),
@@ -424,6 +427,8 @@ def get_products(
             if not shop_row:
                 return ProductsResponse(success=True, message="Products retrieved successfully", data=ProductsResponseData(page=page, page_size=page_size, total_count=0, has_next=False, items=[]))
             base_query = base_query.filter(product.shop_id == shop_row.id)
+            if track_shop_view:
+                track_entity_view(session, request, response, "shop", shop_row.id)
     elif current_user.role == UserRole.USER:
         # authenticated public users should follow public visibility rules
         base_query = session.query(product).filter(product.is_active.is_(True), product.stock_quantity > 0)
@@ -432,6 +437,8 @@ def get_products(
             if not shop_row:
                 return ProductsResponse(success=True, message="Products retrieved successfully", data=ProductsResponseData(page=page, page_size=page_size, total_count=0, has_next=False, items=[]))
             base_query = base_query.filter(product.shop_id == shop_row.id)
+            if track_shop_view:
+                track_entity_view(session, request, response, "shop", shop_row.id)
     elif current_user.role == UserRole.SHOP_OWNER:
         # single-shop vendor: find the shop owned by this user
         shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
@@ -566,6 +573,7 @@ def get_editable_attributes(session: Session = Depends(get_session)):
 @products_router.get("/{product_id}", response_model=ProductDetailResponse)
 def get_product_details(
     request: Request,
+    response: Response,
     product_id: str,
     session: Session = Depends(get_session),
 ):
@@ -591,6 +599,13 @@ def get_product_details(
 
     if selected_product is None:
         raise HTTPException(status_code=404, detail="Product not found")
+
+    attribute_rows = (
+        session.query(product_attribute.attribute_definition_id, product_attribute.attribute_option_id)
+        .filter(product_attribute.product_id == selected_product.id)
+        .all()
+    )
+    track_entity_view(session, request, response, "product", selected_product.id, attribute_rows=attribute_rows)
 
     detail = _serialize_product_detail(session, selected_product)
 
