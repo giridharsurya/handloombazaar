@@ -2,13 +2,15 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import uuid
+from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile, File, Response
+from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile, File, Response, Query
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr, Field
 from db.database import get_session
-from db.db_models import shop, UserRole
-from api.analytics import track_entity_view
+from db.db_models import shop, UserRole, product
+from api.analytics import get_entity_view_counts, track_entity_view
 
 shops_router = APIRouter(prefix="/api/shops", tags=["shops"])
 
@@ -19,6 +21,7 @@ class ShopStatusResponse(BaseModel):
     shop_logo_url: str
     approved: bool
     is_active: bool
+    view_count: int = 0
 
 
 class ShopDetailResponse(ShopStatusResponse):
@@ -65,6 +68,18 @@ def _build_shop_detail_response(selected_shop: shop) -> ShopDetailResponse:
         instagram_url=selected_shop.instagram_url,
         facebook_url=selected_shop.facebook_url,
     )
+
+
+def _get_shop_product_counts(session: Session, shop_ids: list[int]) -> dict[int, int]:
+    if not shop_ids:
+        return {}
+    rows = (
+        session.query(product.shop_id, func.count(product.id))
+        .filter(product.shop_id.in_(shop_ids))
+        .group_by(product.shop_id)
+        .all()
+    )
+    return {shop_id: count for shop_id, count in rows}
 
 
 def _get_manageable_shop(display_id: str, request: Request, session: Session) -> shop:
@@ -216,16 +231,50 @@ def update_shop_logo(
     return _build_shop_detail_response(selected_shop)
 
 
-@shops_router.get("", response_model=list[ShopStatusResponse])
-def list_shops(session: Session = Depends(get_session)):
-    rows = session.query(shop).filter(shop.approved.is_(True), shop.is_active.is_(True)).order_by(shop.created_at.desc()).all()
-    return [
-        ShopStatusResponse(
-            display_id=row.display_id,
-            name=row.name,
-            shop_logo_url=row.shop_logo_url,
-            approved=bool(row.approved),
-            is_active=bool(row.is_active),
-        )
-        for row in rows
-    ]
+@shops_router.get("")
+def list_shops(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    sort_by: Literal["newest", "most-viewed", "product-count"] = Query("newest"),
+    view_count: bool = Query(False),
+    session: Session = Depends(get_session),
+):
+    rows = session.query(shop).filter(shop.approved.is_(True), shop.is_active.is_(True)).all()
+    total_count = len(rows)
+    shop_ids = [r.id for r in rows]
+
+    if sort_by == "most-viewed":
+        counts = get_entity_view_counts(session, "shop", shop_ids)
+        rows.sort(key=lambda r: (-counts.get(r.id, 0), -int(r.created_at.timestamp() if r.created_at else 0), -r.id))
+    elif sort_by == "product-count":
+        product_counts = _get_shop_product_counts(session, shop_ids)
+        rows.sort(key=lambda r: (-product_counts.get(r.id, 0), -int(r.created_at.timestamp() if r.created_at else 0), -r.id))
+    else:
+        rows.sort(key=lambda r: (-int(r.created_at.timestamp() if r.created_at else 0), -r.id))
+
+    offset = (page - 1) * page_size
+    page_rows = rows[offset : offset + page_size]
+    view_counts = {}
+    if sort_by == "most-viewed" or view_count:
+        view_counts = get_entity_view_counts(session, "shop", [r.id for r in page_rows])
+
+    product_counts = _get_shop_product_counts(session, [r.id for r in page_rows])
+
+    return {
+        "items": [
+            {
+                "display_id": row.display_id,
+                "name": row.name,
+                "shop_logo_url": row.shop_logo_url,
+                "approved": bool(row.approved),
+                "is_active": bool(row.is_active),
+                "view_count": view_counts.get(row.id, 0),
+                "product_count": product_counts.get(row.id, 0),
+            }
+            for row in page_rows
+        ],
+        "page": page,
+        "page_size": page_size,
+        "total_count": total_count,
+        "has_next": offset + page_size < total_count,
+    }

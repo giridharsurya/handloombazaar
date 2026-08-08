@@ -111,6 +111,57 @@ class collection(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
+class anonymous_visitor(Base):
+    __tablename__ = "anonymous_visitors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    visitor_token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    last_seen_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    ip_address: Mapped[str] = mapped_column(String(45), nullable=True)
+    user_agent: Mapped[str] = mapped_column(String(512), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class unique_visit(Base):
+    __tablename__ = "unique_visits"
+    __table_args__ = (
+        UniqueConstraint("visitor_id", "entity_type", "entity_id", name="uq_unique_visit_visitor_entity"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    visitor_id: Mapped[int] = mapped_column(Integer, ForeignKey("anonymous_visitors.id", ondelete="CASCADE"), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    entity_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    first_viewed_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    last_viewed_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    visit_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+
+class attribute_view(Base):
+    __tablename__ = "attribute_views"
+    __table_args__ = (
+        UniqueConstraint(
+            "visitor_id",
+            "attribute_definition_id",
+            "attribute_option_id",
+            "entity_type",
+            "entity_id",
+            name="uq_attribute_view_visitor_attribute_entity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    visitor_id: Mapped[int] = mapped_column(Integer, ForeignKey("anonymous_visitors.id", ondelete="CASCADE"), nullable=False)
+    attribute_definition_id: Mapped[int] = mapped_column(Integer, ForeignKey("attribute_definitions.id", ondelete="CASCADE"), nullable=False)
+    attribute_option_id: Mapped[int] = mapped_column(Integer, ForeignKey("attribute_options.id", ondelete="CASCADE"), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    entity_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    first_viewed_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    last_viewed_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    view_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+
 class announcement_banner(Base):
     __tablename__ = "announcement_banners"
     __table_args__ = (

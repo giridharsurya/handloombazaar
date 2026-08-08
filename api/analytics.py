@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Iterable, Optional
 
 from fastapi import Request, Response
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from db.db_models import anonymous_visitor, attribute_view, unique_visit, UserRole
@@ -177,3 +178,15 @@ def track_entity_view(
     except Exception:
         session.rollback()
         raise
+
+
+def get_entity_view_counts(session: Session, entity_type: str, entity_ids: list[int]) -> dict[int, int]:
+    if not entity_ids:
+        return {}
+    rows = (
+        session.query(unique_visit.entity_id, func.coalesce(func.sum(unique_visit.visit_count), 0))
+        .filter(unique_visit.entity_type == entity_type, unique_visit.entity_id.in_(entity_ids))
+        .group_by(unique_visit.entity_id)
+        .all()
+    )
+    return {int(entity_id): int(view_count) for entity_id, view_count in rows}

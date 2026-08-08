@@ -20,12 +20,43 @@ from db.db_models import (
     attribute_definition,
     product,
     product_attribute,
+    unique_visit,
 )
 from api.products import _serialize_listing_product
-from api.analytics import track_entity_view
+from api.analytics import get_entity_view_counts, track_entity_view
 
 
 router = APIRouter(prefix="/api/collections", tags=["Collections"])
+
+def _get_collection_product_counts(session: Session, collection_ids: list[int]) -> dict[int, int]:
+    if not collection_ids:
+        return {}
+
+    collection_ids_set = set(collection_ids)
+    collection_products = select(
+        collection_product.collection_id.label("collection_id"),
+        collection_product.product_id.label("product_id"),
+    ).where(collection_product.collection_id.in_(collection_ids_set))
+
+    shop_collection_products = (
+        select(
+            shop_collection.collection_id.label("collection_id"),
+            shop_collection_product.product_id.label("product_id"),
+        )
+        .join(shop_collection_product, shop_collection.id == shop_collection_product.shop_collection_id)
+        .where(shop_collection.collection_id.in_(collection_ids_set))
+    )
+
+    union_query = collection_products.union_all(shop_collection_products).subquery()
+    counts = (
+        session.query(
+            union_query.c.collection_id,
+            func.count(func.distinct(union_query.c.product_id)).label("product_count"),
+        )
+        .group_by(union_query.c.collection_id)
+        .all()
+    )
+    return {row.collection_id: row.product_count for row in counts}
 
 
 class CollectionCreateRequest(BaseModel):
@@ -58,80 +89,99 @@ class ConstraintsUpdateRequest(BaseModel):
 
 
 @router.get("")
-def list_collections(kind: Optional[str] = None, shop_display_id: Optional[str] = None, session: Session = Depends(get_session), request: Request = None):
+def list_collections(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    kind: Optional[str] = None,
+    shop_display_id: Optional[str] = None,
+    sort_by: Literal["newest", "most-viewed", "product-count"] = Query("newest"),
+    view_count: bool = Query(False),
+    session: Session = Depends(get_session),
+    request: Request = None,
+):
     current_user = getattr(request.state, "current_user", None)
     is_public_request = current_user is None
-    qs = session.query(collection)
-    # Prefer explicit `kind` column on collection: 'system' or 'shop'.
-    # If caller didn't provide a kind (admin page), default to system collections.
     k = (kind or "").strip().lower()
-
-    # Two storage models:
-    # - `collection` table stores system collections (may have constraints in `collection_shops`)
-    # - `shop_collections` table stores shop-specific collections (each row belongs to a shop and may reference a collection)
     items = []
 
     if k == "system":
-        # system collections = entries in `collection` that do NOT have a shop binding
-        # i.e., skip any collection that has a shop_collection referencing it
         subq = session.query(shop_collection.collection_id).distinct()
         collection_query = session.query(collection).filter(~collection.id.in_(subq))
         if is_public_request:
             collection_query = collection_query.filter(collection.is_active.is_(True))
         rows = collection_query.order_by(collection.created_at.desc()).all()
+    else:
+        from db.db_models import shop as shop_model
+        if shop_display_id:
+            shop_row = session.query(shop_model).filter(shop_model.display_id == shop_display_id).first()
+            if not shop_row:
+                return {"items": [], "page": page, "page_size": page_size, "total_count": 0, "has_next": False}
+            col_ids = [r.collection_id for r in session.query(shop_collection.collection_id).filter(shop_collection.shop_id == shop_row.id).all()]
+            if not col_ids:
+                return {"items": [], "page": page, "page_size": page_size, "total_count": 0, "has_next": False}
+            rows = session.query(collection).filter(collection.id.in_(col_ids)).order_by(collection.created_at.desc()).all()
+        else:
+            subq = session.query(shop_collection.collection_id).distinct()
+            rows = session.query(collection).filter(collection.id.in_(subq)).order_by(collection.created_at.desc()).all()
+
+    collection_ids = [r.id for r in rows]
+    counts = get_entity_view_counts(session, "collection", collection_ids) if (view_count or sort_by == "most-viewed") else {}
+    product_counts = _get_collection_product_counts(session, collection_ids) if sort_by == "product-count" else {}
+
+    if k == "system" and shop_display_id:
+        filtered_rows = []
         for r in rows:
-            item = {"id": r.id, "display_id": r.display_id, "name": r.name, "description": r.description, "is_active": r.is_active}
-            # include linked constraint shops (collection_shops) when present
             shops = session.query(collection_shop).filter(collection_shop.collection_id == r.id).all()
             shop_display_ids = [s.shop_display_id for s in shops if s.shop_display_id]
+            if shop_display_ids and shop_display_id not in shop_display_ids:
+                continue
+            filtered_rows.append(r)
+        rows = filtered_rows
+        collection_ids = [r.id for r in rows]
+        counts = get_entity_view_counts(session, "collection", collection_ids) if (view_count or sort_by == "most-viewed") else {}
+        product_counts = _get_collection_product_counts(session, collection_ids) if sort_by == "product-count" else {}
 
-            # If caller specifies a shop context, only return system collections
-            # the shop is allowed to add to:
-            # - no constraints => allowed for any shop
-            # - constrained => allowed only when shop_display_id is present in constraints
-            if shop_display_id:
-                if shop_display_ids and shop_display_id not in shop_display_ids:
-                    continue
+    if sort_by == "most-viewed":
+        rows.sort(key=lambda r: (-counts.get(r.id, 0), -int(r.created_at.timestamp() if r.created_at else 0), -r.id))
+    elif sort_by == "product-count":
+        rows.sort(key=lambda r: (-product_counts.get(r.id, 0), -int(r.created_at.timestamp() if r.created_at else 0), -r.id))
+    else:
+        rows.sort(key=lambda r: (-int(r.created_at.timestamp() if r.created_at else 0), -r.id))
 
-            if shop_display_ids:
-                item["shop_display_ids"] = shop_display_ids
-            items.append(item)
-        return {"items": items}
+    total_count = len(rows)
+    offset = (page - 1) * page_size
+    page_rows = rows[offset : offset + page_size]
 
-    # k == 'shop'
-    # list shop collections from `shop_collections`. If `shop_display_id` provided, filter by that shop.
-    from db.db_models import shop as shop_model
+    page_collection_ids = [r.id for r in page_rows]
+    page_view_counts = {}
+    if view_count or sort_by == "most-viewed":
+        page_view_counts = get_entity_view_counts(session, "collection", page_collection_ids)
+    page_product_counts = _get_collection_product_counts(session, page_collection_ids)
 
-    # k == 'shop'
-    # If a shop_display_id is provided, fetch collection_ids from shop_collections for that shop
-    # and return the authoritative collection rows. If no shop_display_id provided, return
-    # all shop-scoped collections (collections that have a shop_collection row), joining to
-    # collection metadata when available.
-    if shop_display_id:
-        # find the shop id for the display id
-        shop_row = session.query(shop_model).filter(shop_model.display_id == shop_display_id).first()
-        if not shop_row:
-            return {"items": []}
-        col_ids = [r.collection_id for r in session.query(shop_collection.collection_id).filter(shop_collection.shop_id == shop_row.id).all()]
-        if not col_ids:
-            return {"items": []}
-        rows = session.query(collection).filter(collection.id.in_(col_ids)).order_by(collection.created_at.desc()).all()
-        for r in rows:
-            item = {"id": r.id, "display_id": r.display_id, "name": r.name, "description": r.description, "is_active": r.is_active}
-            items.append(item)
-        return {"items": items}
+    for r in page_rows:
+        item = {
+            "id": r.id,
+            "display_id": r.display_id,
+            "name": r.name,
+            "description": r.description,
+            "is_active": r.is_active,
+            "view_count": page_view_counts.get(r.id, 0),
+            "product_count": page_product_counts.get(r.id, 0),
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            scs = session.query(shop_collection).filter(shop_collection.collection_id == r.id).all()
+            if scs:
+                item["shop_bindings"] = [{"shop_id": s.shop_id, "is_active": s.is_active} for s in scs]
 
-    # No shop_display_id: return collections that are shop-scoped (have a shop_collection link).
-    subq = session.query(shop_collection.collection_id).distinct()
-    rows = session.query(collection).filter(collection.id.in_(subq)).order_by(collection.created_at.desc()).all()
-    for r in rows:
-        item = {"id": r.id, "display_id": r.display_id, "name": r.name, "description": r.description, "is_active": r.is_active}
-        # include shop bindings (one or more)
-        scs = session.query(shop_collection).filter(shop_collection.collection_id == r.id).all()
-        if scs:
-            item["shop_bindings"] = [{"shop_id": s.shop_id, "is_active": s.is_active} for s in scs]
         items.append(item)
-    return {"items": items}
+
+    return {
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total_count": total_count,
+        "has_next": offset + page_size < total_count,
+    }
 
 
 @router.post("/create")
@@ -650,7 +700,8 @@ def get_products(
     search: Optional[str] = Query(None),
     min_price: Optional[float] = Query(None, ge=0),
     max_price: Optional[float] = Query(None, ge=0),
-    sort_by: Literal["newest", "price-low", "price-high"] = Query("newest"),
+    sort_by: Literal["newest", "price-low", "price-high", "most-viewed"] = Query("newest"),
+    view_count: bool = Query(False),
     attribute_option_ids: list[int] = Query(default=[]),
     mode: Literal["view", "add", "delete"] = Query("view"),
     track_view: bool = Query(False),
@@ -929,13 +980,36 @@ def get_products(
 
     total_count = prod_q.count()
     offset = (page - 1) * page_size
-    rows = (
-        _apply_sort(prod_q, sort_by)
-        .offset(offset)
-        .limit(page_size)
-        .all()
-    )
-    items = [_serialize_listing_product(session, p) for p in rows]
+    view_counts = {}
+    if sort_by == "most-viewed":
+        views_subq = (
+            session.query(
+                unique_visit.entity_id.label("entity_id"),
+                func.sum(unique_visit.visit_count).label("view_count"),
+            )
+            .filter(unique_visit.entity_type == "product")
+            .group_by(unique_visit.entity_id)
+            .subquery()
+        )
+        rows = (
+            prod_q.outerjoin(views_subq, views_subq.c.entity_id == product.id)
+            .order_by(func.coalesce(views_subq.c.view_count, 0).desc(), product.id.desc())
+            .offset(offset)
+            .limit(page_size)
+            .all()
+        )
+        view_counts = get_entity_view_counts(session, "product", [p.id for p in rows])
+    else:
+        rows = (
+            _apply_sort(prod_q, sort_by)
+            .offset(offset)
+            .limit(page_size)
+            .all()
+        )
+        if view_count:
+            view_counts = get_entity_view_counts(session, "product", [p.id for p in rows])
+
+    items = [_serialize_listing_product(session, p, view_count=view_counts.get(p.id, 0)) for p in rows]
 
     if track_view:
         track_entity_view(session, request, response, "collection", collection_id)

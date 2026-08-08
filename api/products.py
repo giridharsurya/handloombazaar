@@ -19,10 +19,11 @@ from db.db_models import (
     product_group,
     product_image,
     shop,
+    unique_visit,
     user as UserModel,
     UserRole,
 )
-from api.analytics import track_entity_view
+from api.analytics import get_entity_view_counts, track_entity_view
 import uuid
 from datetime import datetime
 
@@ -43,6 +44,7 @@ class ProductListItem(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+    view_count: int = 0
     attributes: list[dict] = []
 
 
@@ -199,7 +201,7 @@ class BulkProductActionResponse(BaseModel):
     affected_count: int
 
 
-def _serialize_listing_product(session: Session, item: product):
+def _serialize_listing_product(session: Session, item: product, view_count: int = 0):
     shop_row = session.query(shop).filter(shop.id == item.shop_id).first()
     primary_image = (
         session.query(product_image)
@@ -229,6 +231,7 @@ def _serialize_listing_product(session: Session, item: product):
         "discount_price": item.discount_price,
         "stock_quantity": item.stock_quantity,
         "is_active": item.is_active,
+        "view_count": view_count,
         "attributes": [
             {
                 "definition_id": attr.attribute_definition_id,
@@ -385,11 +388,13 @@ def _apply_attribute_option_filters(base_query, attribute_option_ids: list[int],
     return base_query
 
 
-def _apply_sort(base_query, sort_by: Literal["newest", "price-low", "price-high"]):
+def _apply_sort(base_query, sort_by: Literal["newest", "price-low", "price-high", "most-viewed"]):
     if sort_by == "price-low":
         return base_query.order_by(func.coalesce(product.discount_price, product.price).asc(), product.id.desc())
     if sort_by == "price-high":
         return base_query.order_by(func.coalesce(product.discount_price, product.price).desc(), product.id.desc())
+    if sort_by == "most-viewed":
+        return base_query.order_by(product.id.desc())
     return base_query.order_by(product.created_at.desc(), product.id.desc())
 
 
@@ -404,7 +409,8 @@ def get_products(
     track_shop_view: bool = Query(False),
     min_price: Optional[float] = Query(None, ge=0),
     max_price: Optional[float] = Query(None, ge=0),
-    sort_by: Literal["newest", "price-low", "price-high"] = Query("newest"),
+    sort_by: Literal["newest", "price-low", "price-high", "most-viewed"] = Query("newest"),
+    view_count: bool = Query(False),
     attribute_option_ids: list[int] = Query(
         default=[],
         description="Repeat query param as attribute_option_ids=11&attribute_option_ids=24",
@@ -473,16 +479,41 @@ def get_products(
     base_query = _apply_attribute_filters(base_query, attribute_filters)
 
     total_count = base_query.count()
-    items = (
-        _apply_sort(base_query, sort_by)
-        .offset(offset)
-        .limit(page_size)
-        .all()
-    )
+    view_counts = {}
+    if sort_by == "most-viewed":
+        views_subq = (
+            session.query(
+                unique_visit.entity_id.label("entity_id"),
+                func.sum(unique_visit.visit_count).label("view_count"),
+            )
+            .filter(unique_visit.entity_type == "product")
+            .group_by(unique_visit.entity_id)
+            .subquery()
+        )
+
+        items = (
+            base_query.outerjoin(views_subq, views_subq.c.entity_id == product.id)
+            .order_by(func.coalesce(views_subq.c.view_count, 0).desc(), product.id.desc())
+            .offset(offset)
+            .limit(page_size)
+            .all()
+        )
+        product_ids = [p.id for p in items]
+        view_counts = get_entity_view_counts(session, "product", product_ids)
+    else:
+        items = (
+            _apply_sort(base_query, sort_by)
+            .offset(offset)
+            .limit(page_size)
+            .all()
+        )
+        if view_count:
+            product_ids = [p.id for p in items]
+            view_counts = get_entity_view_counts(session, "product", product_ids)
 
     items_out = []
     for p in items:
-        row = _serialize_listing_product(session, p)
+        row = _serialize_listing_product(session, p, view_count=view_counts.get(int(p.id), 0))
         items_out.append(row)
 
     temp = ProductsResponseData(
