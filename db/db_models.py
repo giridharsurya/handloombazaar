@@ -109,6 +109,8 @@ class collection(Base):
     created_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    display_on_homepage: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    homepage_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
 class anonymous_visitor(Base):
@@ -181,6 +183,38 @@ class announcement_banner(Base):
     created_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
 
+
+class announcement_banner_order(Base):
+    __tablename__ = "announcement_banner_orders"
+    __table_args__ = (
+        UniqueConstraint("announcement_banner_id", "shop_id", name="uq_announcement_banner_order"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    announcement_banner_id: Mapped[int] = mapped_column(Integer, ForeignKey("announcement_banners.id", ondelete="CASCADE"), nullable=False)
+    shop_id: Mapped[int] = mapped_column(Integer, ForeignKey("shops.id", ondelete="CASCADE"), nullable=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_visible: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+
+
+class collection_overview_slot(Base):
+    __tablename__ = "collection_overview_slots"
+    __table_args__ = (
+        UniqueConstraint("shop_display_id", "slot_position", name="uq_collection_overview_slot"),
+        UniqueConstraint("shop_display_id", "collection_id", name="uq_collection_overview_slot_collection"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    shop_id: Mapped[int] = mapped_column(Integer, ForeignKey("shops.id", ondelete="CASCADE"), nullable=True)
+    shop_display_id: Mapped[str] = mapped_column(String(8), nullable=False, default="")
+    collection_id: Mapped[int] = mapped_column(Integer, ForeignKey("collections.id", ondelete="CASCADE"), nullable=False)
+    slot_position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+
+
 class collection_product(Base):
     __tablename__ = "collection_products"
 
@@ -199,6 +233,22 @@ class collection_shop(Base):
     shop_id: Mapped[int] = mapped_column(Integer, ForeignKey("shops.id", ondelete='CASCADE'), nullable=False)
     # optional store of shop display id for easier lookups
     shop_display_id: Mapped[str] = mapped_column(String(8), nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
+
+
+class collection_shop_homepage_display(Base):
+    __tablename__ = "collection_shop_homepage_displays"
+    __table_args__ = (
+        UniqueConstraint("collection_id", "shop_id", name="uq_collection_shop_homepage_displays_collection_shop"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    collection_id: Mapped[int] = mapped_column(Integer, ForeignKey("collections.id", ondelete='CASCADE'), nullable=False)
+    shop_id: Mapped[int] = mapped_column(Integer, ForeignKey("shops.id", ondelete='CASCADE'), nullable=False)
+    shop_display_id: Mapped[str] = mapped_column(String(8), nullable=True)
+    display_on_homepage: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    homepage_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[DateTime] = mapped_column(DateTime, nullable=False)
 

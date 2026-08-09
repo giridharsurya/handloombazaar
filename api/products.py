@@ -110,6 +110,7 @@ class ProductDetail(BaseModel):
     created_at: datetime
     updated_at: datetime
     is_active: bool
+    view_count: int = 0
     shop: ShopSummary
     images: List[str]
     attributes: List[ProductAttributeItem]
@@ -243,7 +244,7 @@ def _serialize_listing_product(session: Session, item: product, view_count: int 
     }
 
 
-def _serialize_product_detail(session: Session, item: product):
+def _serialize_product_detail(session: Session, item: product, view_count: int = 0):
     shop_row = session.query(shop).filter(shop.id == item.shop_id).first()
 
     group_count = 0
@@ -291,6 +292,7 @@ def _serialize_product_detail(session: Session, item: product):
         "created_at": item.created_at,
         "updated_at": item.updated_at,
         "is_active": item.is_active,
+        "view_count": view_count,
         "shop": {
             "display_id": shop_row.display_id,
             "name": shop_row.name,
@@ -479,7 +481,7 @@ def get_products(
     base_query = _apply_attribute_filters(base_query, attribute_filters)
 
     total_count = base_query.count()
-    view_counts = {}
+
     if sort_by == "most-viewed":
         views_subq = (
             session.query(
@@ -498,8 +500,6 @@ def get_products(
             .limit(page_size)
             .all()
         )
-        product_ids = [p.id for p in items]
-        view_counts = get_entity_view_counts(session, "product", product_ids)
     else:
         items = (
             _apply_sort(base_query, sort_by)
@@ -507,9 +507,9 @@ def get_products(
             .limit(page_size)
             .all()
         )
-        if view_count:
-            product_ids = [p.id for p in items]
-            view_counts = get_entity_view_counts(session, "product", product_ids)
+
+    product_ids = [p.id for p in items]
+    view_counts = get_entity_view_counts(session, "product", product_ids) if product_ids else {}
 
     items_out = []
     for p in items:
@@ -638,7 +638,12 @@ def get_product_details(
     )
     track_entity_view(session, request, response, "product", selected_product.id, attribute_rows=attribute_rows)
 
-    detail = _serialize_product_detail(session, selected_product)
+    view_counts = get_entity_view_counts(session, "product", [selected_product.id])
+    detail = _serialize_product_detail(
+        session,
+        selected_product,
+        view_count=view_counts.get(selected_product.id, 0),
+    )
 
     product_model = ProductDetail(
         display_id=detail["display_id"],
@@ -653,6 +658,7 @@ def get_product_details(
         created_at=detail.get("created_at"),
         updated_at=detail.get("updated_at"),
         is_active=detail.get("is_active"),
+        view_count=detail.get("view_count", 0),
         shop=ShopSummary(**detail.get("shop", {})),
         images=detail.get("images", []),
         attributes=[ProductAttributeItem(**a) for a in detail.get("attributes", [])],
@@ -700,10 +706,12 @@ def get_product_variants(
         vq = vq.filter(product.is_active.is_(True))
 
     variants = vq.order_by(product.created_at.desc()).all()
+    variant_ids = [p.id for p in variants]
+    view_counts = get_entity_view_counts(session, "product", variant_ids) if variant_ids else {}
 
     items = []
     for p in variants:
-        row = _serialize_listing_product(session, p)
+        row = _serialize_listing_product(session, p, view_count=view_counts.get(p.id, 0))
         if current_user is None:
             row.pop("is_active", None)
         items.append(ProductListItem(**row))

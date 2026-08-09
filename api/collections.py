@@ -4,16 +4,18 @@ from typing import List, Optional, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, exists, func, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from db.database import get_session
 from db.db_models import (
     collection,
     collection_shop,
+    collection_shop_homepage_display,
     shop_collection,
     shop_collection_product,
     collection_attribute_option,
+    collection_overview_slot,
     collection_product,
     shop,
     attribute_option,
@@ -88,12 +90,32 @@ class ConstraintsUpdateRequest(BaseModel):
     required_attributes: List[RequiredAttributeItem] = Field(default_factory=list)
 
 
+class HomepageToggleRequest(BaseModel):
+    collection_id: int
+    display_on_homepage: bool
+    shop_display_id: Optional[str] = None
+
+
+class HomepageOrderRequest(BaseModel):
+    collection_ids: List[int] = Field(default_factory=list)
+    shop_display_id: Optional[str] = None
+
+
+class OverviewSlotItem(BaseModel):
+    collection_id: int
+    slot_position: int
+
+class OverviewSlotsRequest(BaseModel):
+    shop_display_id: Optional[str] = None
+    slots: List[OverviewSlotItem] = Field(default_factory=list)
+
 @router.get("")
 def list_collections(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     kind: Optional[str] = None,
     shop_display_id: Optional[str] = None,
+    display_on_homepage: bool = Query(False),
     sort_by: Literal["newest", "most-viewed", "product-count"] = Query("newest"),
     view_count: bool = Query(False),
     session: Session = Depends(get_session),
@@ -102,14 +124,25 @@ def list_collections(
     current_user = getattr(request.state, "current_user", None)
     is_public_request = current_user is None
     k = (kind or "").strip().lower()
+    target_shop_id = None
     items = []
 
     if k == "system":
-        subq = session.query(shop_collection.collection_id).distinct()
-        collection_query = session.query(collection).filter(~collection.id.in_(subq))
-        if is_public_request:
-            collection_query = collection_query.filter(collection.is_active.is_(True))
-        rows = collection_query.order_by(collection.created_at.desc()).all()
+        from db.db_models import shop as shop_model
+        if shop_display_id:
+            shop_row = session.query(shop_model).filter(shop_model.display_id == shop_display_id).first()
+            if not shop_row:
+                return {"items": [], "page": page, "page_size": page_size, "total_count": 0, "has_next": False}
+            target_shop_id = shop_row.id
+            rows = _list_system_collections_for_shop(session, shop_row, display_on_homepage, is_public_request)
+        else:
+            subq = session.query(shop_collection.collection_id).distinct()
+            collection_query = session.query(collection).filter(~collection.id.in_(subq))
+            if display_on_homepage:
+                collection_query = collection_query.filter(collection.display_on_homepage.is_(True))
+            if is_public_request:
+                collection_query = collection_query.filter(collection.is_active.is_(True))
+            rows = collection_query.order_by(collection.created_at.desc()).all()
     else:
         from db.db_models import shop as shop_model
         if shop_display_id:
@@ -119,10 +152,20 @@ def list_collections(
             col_ids = [r.collection_id for r in session.query(shop_collection.collection_id).filter(shop_collection.shop_id == shop_row.id).all()]
             if not col_ids:
                 return {"items": [], "page": page, "page_size": page_size, "total_count": 0, "has_next": False}
-            rows = session.query(collection).filter(collection.id.in_(col_ids)).order_by(collection.created_at.desc()).all()
+            collection_query = session.query(collection).filter(collection.id.in_(col_ids))
+            if display_on_homepage:
+                collection_query = collection_query.filter(collection.display_on_homepage.is_(True))
+            if is_public_request:
+                collection_query = collection_query.filter(collection.is_active.is_(True))
+            rows = collection_query.order_by(collection.created_at.desc()).all()
         else:
             subq = session.query(shop_collection.collection_id).distinct()
-            rows = session.query(collection).filter(collection.id.in_(subq)).order_by(collection.created_at.desc()).all()
+            collection_query = session.query(collection).filter(collection.id.in_(subq))
+            if display_on_homepage:
+                collection_query = collection_query.filter(collection.display_on_homepage.is_(True))
+            if is_public_request:
+                collection_query = collection_query.filter(collection.is_active.is_(True))
+            rows = collection_query.order_by(collection.created_at.desc()).all()
 
     collection_ids = [r.id for r in rows]
     counts = get_entity_view_counts(session, "collection", collection_ids) if (view_count or sort_by == "most-viewed") else {}
@@ -141,7 +184,17 @@ def list_collections(
         counts = get_entity_view_counts(session, "collection", collection_ids) if (view_count or sort_by == "most-viewed") else {}
         product_counts = _get_collection_product_counts(session, collection_ids) if sort_by == "product-count" else {}
 
-    if sort_by == "most-viewed":
+    if k == "system" and shop_display_id and display_on_homepage:
+        rows.sort(
+            key=lambda r: (
+                -_shop_collection_homepage_order(session, r.id, target_shop_id or 0),
+                -int(r.created_at.timestamp() if r.created_at else 0),
+                -r.id,
+            )
+        )
+    elif display_on_homepage:
+        rows.sort(key=lambda r: (-(getattr(r, "homepage_order", 0) or 0), -int(r.created_at.timestamp() if r.created_at else 0), -r.id))
+    elif sort_by == "most-viewed":
         rows.sort(key=lambda r: (-counts.get(r.id, 0), -int(r.created_at.timestamp() if r.created_at else 0), -r.id))
     elif sort_by == "product-count":
         rows.sort(key=lambda r: (-product_counts.get(r.id, 0), -int(r.created_at.timestamp() if r.created_at else 0), -r.id))
@@ -165,13 +218,16 @@ def list_collections(
             "name": r.name,
             "description": r.description,
             "is_active": r.is_active,
+            "display_on_homepage": _shop_collection_display_on_homepage(session, r.id, target_shop_id) if k == "system" and target_shop_id is not None else getattr(r, "display_on_homepage", False),
+            "homepage_order": _shop_collection_homepage_order(session, r.id, target_shop_id) if k == "system" and target_shop_id is not None else getattr(r, "homepage_order", 0),
             "view_count": page_view_counts.get(r.id, 0),
             "product_count": page_product_counts.get(r.id, 0),
                 "created_at": r.created_at,
                 "updated_at": r.updated_at,
-            scs = session.query(shop_collection).filter(shop_collection.collection_id == r.id).all()
-            if scs:
-                item["shop_bindings"] = [{"shop_id": s.shop_id, "is_active": s.is_active} for s in scs]
+        }
+        scs = session.query(shop_collection).filter(shop_collection.collection_id == r.id).all()
+        if scs:
+            item["shop_bindings"] = [{"shop_id": s.shop_id, "is_active": s.is_active} for s in scs]
 
         items.append(item)
 
@@ -650,6 +706,581 @@ def update_constraints(collection_id: int, payload: ConstraintsUpdateRequest, re
     return {"message": "Constraints updated"}
 
 
+@router.post("/homepage/toggle")
+def toggle_homepage_display(
+    payload: HomepageToggleRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    role = getattr(current_user, "role", None)
+    role_val = role.value if hasattr(role, "value") else role
+    is_admin = str(role_val).lower() == "admin" if role_val else False
+
+    target_shop_id = None
+    if payload.shop_display_id:
+        shop_row = _resolve_shop(session, payload.shop_display_id)
+        if shop_row is None:
+            raise HTTPException(status_code=400, detail="Invalid shop_display_id")
+        target_shop_id = shop_row.id
+
+    if not is_admin:
+        if target_shop_id is None:
+            raise HTTPException(status_code=403, detail="Only admins can update homepage display")
+
+        owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if not owner_shop or owner_shop.id != target_shop_id:
+            raise HTTPException(status_code=403, detail="Only shop owners can update their own shop collections")
+
+    c = session.query(collection).filter(collection.id == payload.collection_id).first()
+    if c is None:
+        raise HTTPException(status_code=404, detail="Collection not found")
+
+    collection_is_shop_scoped = _get_shop_collection_scope(session, c.id)
+    if not is_admin:
+        if collection_is_shop_scoped:
+            shop_collection_row = session.query(shop_collection).filter(shop_collection.collection_id == c.id, shop_collection.shop_id == target_shop_id).first()
+            if shop_collection_row is None:
+                raise HTTPException(status_code=403, detail="Collection does not belong to this shop")
+        else:
+            if not _collection_visible_for_shop(session, c.id, target_shop_id):
+                raise HTTPException(status_code=403, detail="Only shops can change homepage settings for collections visible to that shop")
+
+    if target_shop_id is not None and not collection_is_shop_scoped:
+        override = _get_shop_homepage_display(session, c.id, target_shop_id)
+        if payload.display_on_homepage:
+            current_max = session.query(func.max(collection_shop_homepage_display.homepage_order)).filter(collection_shop_homepage_display.shop_id == target_shop_id).scalar() or 0
+            if override is None:
+                override = collection_shop_homepage_display(
+                    collection_id=c.id,
+                    shop_id=target_shop_id,
+                    shop_display_id=payload.shop_display_id,
+                    display_on_homepage=True,
+                    homepage_order=int(current_max) + 1,
+                    created_at=datetime.now(),
+                    updated_at=datetime.now(),
+                )
+                session.add(override)
+            else:
+                override.display_on_homepage = True
+                override.homepage_order = int(current_max) + 1
+                override.updated_at = datetime.now()
+        else:
+            if override is None:
+                override = collection_shop_homepage_display(
+                    collection_id=c.id,
+                    shop_id=target_shop_id,
+                    shop_display_id=payload.shop_display_id,
+                    display_on_homepage=False,
+                    homepage_order=0,
+                    created_at=datetime.now(),
+                    updated_at=datetime.now(),
+                )
+                session.add(override)
+            else:
+                override.display_on_homepage = False
+                override.homepage_order = 0
+                override.updated_at = datetime.now()
+        session.commit()
+        return {"message": "Homepage display updated", "collection": {"id": c.id, "display_on_homepage": override.display_on_homepage, "homepage_order": override.homepage_order}}
+
+    c.display_on_homepage = payload.display_on_homepage
+    if payload.display_on_homepage:
+        current_max = session.query(func.max(collection.homepage_order)).scalar() or 0
+        c.homepage_order = int(current_max) + 1
+    else:
+        c.homepage_order = 0
+    c.updated_at = datetime.now()
+    session.commit()
+    return {"message": "Homepage display updated", "collection": {"id": c.id, "display_on_homepage": c.display_on_homepage, "homepage_order": c.homepage_order}}
+
+
+@router.post("/homepage/order")
+def order_homepage_collections(
+    payload: HomepageOrderRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    role = getattr(current_user, "role", None)
+    role_val = role.value if hasattr(role, "value") else role
+    is_admin = str(role_val).lower() == "admin" if role_val else False
+
+    target_shop_id = None
+    if payload.shop_display_id:
+        shop_row = _resolve_shop(session, payload.shop_display_id)
+        if shop_row is None:
+            raise HTTPException(status_code=400, detail="Invalid shop_display_id")
+        target_shop_id = shop_row.id
+
+    if target_shop_id is None and not is_admin:
+        raise HTTPException(status_code=403, detail="Only admins can reorder global homepage collections")
+
+    if target_shop_id is not None and not is_admin:
+        owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if not owner_shop or owner_shop.id != target_shop_id:
+            raise HTTPException(status_code=403, detail="Only shop owners can update their own shop overview order")
+
+    if len(payload.collection_ids) != len(set(payload.collection_ids)):
+        raise HTTPException(status_code=400, detail="collection_ids must contain unique values")
+
+    rows = session.query(collection).filter(collection.id.in_(payload.collection_ids)).all()
+    if len(rows) != len(payload.collection_ids):
+        raise HTTPException(status_code=400, detail="One or more collections invalid")
+
+    invalid_rows = [r.id for r in rows if not getattr(r, "display_on_homepage", False)]
+    if invalid_rows:
+        raise HTTPException(status_code=400, detail="One or more collections are not marked for homepage display")
+
+    if target_shop_id is not None:
+        invalid_rows = [r.id for r in rows if not _collection_visible_for_shop(session, r.id, target_shop_id)]
+        if invalid_rows:
+            raise HTTPException(status_code=400, detail="One or more collections are not visible for this shop")
+
+    total = len(payload.collection_ids)
+    for index, collection_id in enumerate(payload.collection_ids):
+        row = next((r for r in rows if r.id == collection_id), None)
+        if row is None:
+            continue
+        if target_shop_id is not None and not _get_shop_collection_scope(session, row.id):
+            override = _get_shop_homepage_display(session, row.id, target_shop_id)
+            if override is None:
+                override = collection_shop_homepage_display(
+                    collection_id=row.id,
+                    shop_id=target_shop_id,
+                    shop_display_id=payload.shop_display_id,
+                    display_on_homepage=True,
+                    homepage_order=total - index,
+                    created_at=datetime.now(),
+                    updated_at=datetime.now(),
+                )
+                session.add(override)
+            else:
+                override.display_on_homepage = True
+                override.homepage_order = total - index
+                override.updated_at = datetime.now()
+        else:
+            row.homepage_order = total - index
+            row.updated_at = datetime.now()
+    session.commit()
+    return {"message": "Homepage collection order updated"}
+
+
+def _resolve_shop(session: Session, shop_display_id: Optional[str]):
+    if not shop_display_id:
+        return None
+    return session.query(shop).filter(shop.display_id == shop_display_id).first()
+
+
+def _get_shop_homepage_display(session: Session, collection_id: int, shop_id: int):
+    return (
+        session.query(collection_shop_homepage_display)
+        .filter(
+            collection_shop_homepage_display.collection_id == collection_id,
+            collection_shop_homepage_display.shop_id == shop_id,
+        )
+        .first()
+    )
+
+
+def _shop_collection_display_on_homepage(session: Session, collection_id: int, shop_id: int) -> bool:
+    override = _get_shop_homepage_display(session, collection_id, shop_id)
+    if override is not None:
+        return override.display_on_homepage
+    c = session.query(collection).filter(collection.id == collection_id).first()
+    return bool(c and c.display_on_homepage)
+
+
+def _shop_collection_homepage_order(session: Session, collection_id: int, shop_id: int) -> int:
+    override = _get_shop_homepage_display(session, collection_id, shop_id)
+    if override is not None:
+        return override.homepage_order
+    c = session.query(collection).filter(collection.id == collection_id).first()
+    return int(getattr(c, "homepage_order", 0) or 0)
+
+
+def _list_system_collections_for_shop(session: Session, shop_row, display_on_homepage: bool, is_public_request: bool):
+    subq = session.query(shop_collection.collection_id).distinct()
+    collection_query = session.query(collection).filter(~collection.id.in_(subq))
+    if is_public_request:
+        collection_query = collection_query.filter(collection.is_active.is_(True))
+    collection_query = collection_query.filter(
+        or_(
+            ~exists(select(collection_shop.id).where(collection_shop.collection_id == collection.id)),
+            exists(select(collection_shop.id).where(collection_shop.collection_id == collection.id, collection_shop.shop_id == shop_row.id)),
+        )
+    )
+    collection_query = collection_query.filter(
+        exists(
+            select(collection_product.id)
+            .join(product, product.id == collection_product.product_id)
+            .where(collection_product.collection_id == collection.id, product.shop_id == shop_row.id)
+        )
+    )
+    rows = collection_query.all()
+    if display_on_homepage:
+        rows = [row for row in rows if _shop_collection_display_on_homepage(session, row.id, shop_row.id)]
+    return rows
+
+
+def _eligible_shop_overview_collections(session: Session, shop_row):
+    shop_collection_ids = [r.collection_id for r in session.query(shop_collection.collection_id).filter(shop_collection.shop_id == shop_row.id).all()]
+
+    shop_collections = []
+    if shop_collection_ids:
+        shop_collections = session.query(collection).filter(collection.id.in_(shop_collection_ids)).all()
+
+    system_collections = (
+        session.query(collection)
+        .filter(~collection.id.in_(session.query(shop_collection.collection_id).distinct()))
+        .filter(collection.is_active.is_(True))
+        .filter(
+            or_(
+                ~exists(select(collection_shop.id).where(collection_shop.collection_id == collection.id)),
+                exists(select(collection_shop.id).where(collection_shop.collection_id == collection.id, collection_shop.shop_id == shop_row.id)),
+            )
+        )
+        .filter(
+            exists(
+                select(collection_product.id)
+                .join(product, product.id == collection_product.product_id)
+                .where(collection_product.collection_id == collection.id, product.shop_id == shop_row.id)
+            )
+        )
+        .all()
+    )
+
+    shop_collections.sort(key=lambda r: (-int(r.created_at.timestamp() if r.created_at else 0), -r.id))
+    system_collections.sort(key=lambda r: (-int(r.created_at.timestamp() if r.created_at else 0), -r.id))
+    return shop_collections + system_collections
+
+
+def _serialize_overview_slot(slot, session: Session):
+    collection_row = session.query(collection).filter(collection.id == slot.collection_id).first()
+    if collection_row is None:
+        return None
+    return {
+        "id": slot.id,
+        "shop_id": slot.shop_id,
+        "shop_display_id": slot.shop_display_id or None,
+        "collection_id": slot.collection_id,
+        "slot_position": slot.slot_position,
+        "created_at": slot.created_at,
+        "updated_at": slot.updated_at,
+        "collection": {
+            "id": collection_row.id,
+            "display_id": collection_row.display_id,
+            "name": collection_row.name,
+            "description": collection_row.description,
+            "is_active": collection_row.is_active,
+            "created_at": collection_row.created_at,
+            "updated_at": collection_row.updated_at,
+        },
+    }
+
+
+def _get_shop_collection_scope(session: Session, collection_id: int):
+    return session.query(shop_collection).filter(shop_collection.collection_id == collection_id).first() is not None
+
+
+def _collection_visible_for_shop(session: Session, collection_id: int, shop_id: int) -> bool:
+    c = session.query(collection).filter(collection.id == collection_id, collection.is_active.is_(True)).first()
+    if c is None:
+        return False
+
+    # If this is a shop-scoped collection, it is visible only when bound to the shop.
+    if _get_shop_collection_scope(session, collection_id):
+        return session.query(shop_collection).filter(shop_collection.collection_id == collection_id, shop_collection.shop_id == shop_id).count() > 0
+
+    # system collection visibility by allowed shop restrictions
+    allowed_shop_ids = [row.shop_id for row in session.query(collection_shop).filter(collection_shop.collection_id == collection_id).all()]
+    if allowed_shop_ids and shop_id not in allowed_shop_ids:
+        return False
+
+    # Ensure the system collection has products for this shop before making it visible.
+    return (
+        session.query(collection_product)
+        .join(product, product.id == collection_product.product_id)
+        .filter(collection_product.collection_id == collection_id, product.shop_id == shop_id)
+        .count()
+        > 0
+    )
+
+
+def _default_shop_overview_slots(session: Session, shop_row):
+    shop_collections = (
+        session.query(collection)
+        .join(shop_collection, shop_collection.collection_id == collection.id)
+        .filter(shop_collection.shop_id == shop_row.id, collection.is_active.is_(True))
+        .order_by(collection.created_at.desc())
+        .all()
+    )
+
+    system_collections = (
+        session.query(collection)
+        .filter(collection.is_active.is_(True))
+        .filter(~collection.id.in_(session.query(shop_collection.collection_id).distinct()))
+        .all()
+    )
+
+    def is_allowed_system(col):
+        allowed_shop_ids = [row.shop_id for row in session.query(collection_shop).filter(collection_shop.collection_id == col.id).all()]
+        return not allowed_shop_ids or shop_row.id in allowed_shop_ids
+
+    visible_system = [col for col in system_collections if is_allowed_system(col)]
+    visible_system.sort(key=lambda r: (-int(r.created_at.timestamp() if r.created_at else 0), -r.id))
+
+    featured = None
+    for col in visible_system:
+        if col.display_id and "featured" in col.display_id.lower():
+            featured = col
+            break
+        if col.name and "featured" in col.name.lower():
+            featured = col
+            break
+
+    chosen: list[dict] = []
+    if featured:
+        chosen.append({"collection": featured, "slot_position": 0})
+
+    remaining_system = [col for col in visible_system if not featured or col.id != featured.id]
+    if len(chosen) < 2 and remaining_system:
+        chosen.append({"collection": remaining_system[0], "slot_position": len(chosen)})
+
+    selected_shop = shop_collections[:2]
+    for idx, col in enumerate(selected_shop, start=2):
+        chosen.append({"collection": col, "slot_position": idx})
+
+    if len(chosen) < 4:
+        extra = [col for col in visible_system if col not in [item["collection"] for item in chosen]] + [col for col in shop_collections if col not in selected_shop]
+        for col in extra:
+            if len(chosen) >= 4:
+                break
+            chosen.append({"collection": col, "slot_position": len(chosen)})
+
+    return [
+        {
+            "id": 0,
+            "shop_id": shop_row.id,
+            "shop_display_id": shop_row.display_id,
+            "collection_id": item["collection"].id,
+            "slot_position": item["slot_position"],
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+            "collection": {
+                "id": item["collection"].id,
+                "display_id": item["collection"].display_id,
+                "name": item["collection"].name,
+                "description": item["collection"].description,
+                "is_active": item["collection"].is_active,
+                "created_at": item["collection"].created_at,
+                "updated_at": item["collection"].updated_at,
+            },
+        }
+        for item in chosen
+    ]
+
+
+def _default_global_overview_slots(session: Session):
+    system_collections = (
+        session.query(collection)
+        .filter(collection.is_active.is_(True))
+        .filter(~collection.id.in_(session.query(shop_collection.collection_id).distinct()))
+        .all()
+    )
+    system_collections.sort(key=lambda r: (-int(r.created_at.timestamp() if r.created_at else 0), -r.id))
+
+    featured = None
+    for col in system_collections:
+        if col.display_id and "featured" in col.display_id.lower():
+            featured = col
+            break
+        if col.name and "featured" in col.name.lower():
+            featured = col
+            break
+
+    chosen = []
+    if featured:
+        chosen.append(featured)
+
+    remaining = [col for col in system_collections if not featured or col.id != featured.id]
+    for col in remaining:
+        if len(chosen) >= 4:
+            break
+        chosen.append(col)
+
+    return [
+        {
+            "id": 0,
+            "shop_id": None,
+            "shop_display_id": None,
+            "collection_id": col.id,
+            "slot_position": index,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+            "collection": {
+                "id": col.id,
+                "display_id": col.display_id,
+                "name": col.name,
+                "description": col.description,
+                "is_active": col.is_active,
+                "created_at": col.created_at,
+                "updated_at": col.updated_at,
+            },
+        }
+        for index, col in enumerate(chosen)
+    ]
+
+
+@router.get("/overview")
+def list_overview_slots(
+    shop_display_id: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    if shop_display_id:
+        shop_row = _resolve_shop(session, shop_display_id)
+        if shop_row is None:
+            return {"items": []}
+
+        rows = (
+            session.query(collection_overview_slot)
+            .filter(collection_overview_slot.shop_display_id == shop_display_id)
+            .order_by(collection_overview_slot.slot_position)
+            .all()
+        )
+        if rows:
+            items = [item for item in (_serialize_overview_slot(row, session) for row in rows) if item is not None]
+            return {"items": items}
+
+        collections = _eligible_shop_overview_collections(session, shop_row)
+        return {
+            "items": [
+                {
+                    "id": 0,
+                    "shop_id": shop_row.id,
+                    "shop_display_id": shop_row.display_id,
+                    "collection_id": col.id,
+                    "slot_position": index,
+                    "created_at": datetime.now(),
+                    "updated_at": datetime.now(),
+                    "collection": {
+                        "id": col.id,
+                        "display_id": col.display_id,
+                        "name": col.name,
+                        "description": col.description,
+                        "is_active": col.is_active,
+                        "created_at": col.created_at,
+                        "updated_at": col.updated_at,
+                    },
+                }
+                for index, col in enumerate(collections)
+            ]
+        }
+
+    rows = (
+        session.query(collection_overview_slot)
+        .filter(collection_overview_slot.shop_display_id == "")
+        .order_by(collection_overview_slot.slot_position)
+        .all()
+    )
+    if rows:
+        items = [item for item in (_serialize_overview_slot(row, session) for row in rows) if item is not None]
+        return {"items": items}
+    return {"items": _default_global_overview_slots(session)}
+
+
+@router.post("/overview/order")
+def order_overview_slots(
+    payload: OverviewSlotsRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    role = getattr(current_user, "role", None)
+    role_val = role.value if hasattr(role, "value") else role
+    is_admin = str(role_val).lower() == "admin" if role_val else False
+
+    target_shop_id = None
+    target_shop_display_id = ""
+    if payload.shop_display_id:
+        shop_row = _resolve_shop(session, payload.shop_display_id)
+        if not shop_row:
+            raise HTTPException(status_code=400, detail="Invalid shop_display_id")
+        target_shop_id = shop_row.id
+        target_shop_display_id = shop_row.display_id or ""
+
+    if not is_admin and target_shop_id is None:
+        raise HTTPException(status_code=403, detail="Only admins can update global overview slots")
+
+    if target_shop_id is not None and not is_admin:
+        owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if not owner_shop or owner_shop.id != target_shop_id:
+            raise HTTPException(status_code=403, detail="Only shop owners can update their own overview slots")
+
+    if any(slot.slot_position < 0 or slot.slot_position > 3 for slot in payload.slots):
+        raise HTTPException(status_code=400, detail="slot_position must be between 0 and 3")
+
+    if len(payload.slots) != len({slot.slot_position for slot in payload.slots}):
+        raise HTTPException(status_code=400, detail="slot_position must be unique")
+
+    if len(payload.slots) > 4:
+        raise HTTPException(status_code=400, detail="No more than 4 overview slots are allowed")
+
+    if target_shop_id is None:
+        for slot in payload.slots:
+            if session.query(shop_collection).filter(shop_collection.collection_id == slot.collection_id).count() > 0:
+                raise HTTPException(status_code=400, detail="Global overview slots may only include system collections")
+    else:
+        for slot in payload.slots:
+            c = session.query(collection).filter(collection.id == slot.collection_id, collection.is_active.is_(True)).first()
+            if c is None:
+                raise HTTPException(status_code=400, detail=f"Collection not found: {slot.collection_id}")
+            is_shop_bound = session.query(shop_collection).filter(shop_collection.collection_id == slot.collection_id).count() > 0
+            if slot.slot_position < 2:
+                if is_shop_bound:
+                    raise HTTPException(status_code=400, detail="System overview slots must reference a system collection")
+                allowed_shop_ids = [row.shop_id for row in session.query(collection_shop).filter(collection_shop.collection_id == slot.collection_id).all()]
+                if allowed_shop_ids and target_shop_id not in allowed_shop_ids:
+                    raise HTTPException(status_code=400, detail="System collection is not visible for this shop")
+            else:
+                if not is_shop_bound:
+                    raise HTTPException(status_code=400, detail="Shop overview slots must reference a shop collection")
+                if session.query(shop_collection).filter(shop_collection.collection_id == slot.collection_id, shop_collection.shop_id == target_shop_id).count() == 0:
+                    raise HTTPException(status_code=400, detail="Shop collection does not belong to the selected shop")
+
+    existing_query = session.query(collection_overview_slot)
+    if target_shop_id is None:
+        existing_query = existing_query.filter(collection_overview_slot.shop_display_id == "")
+    else:
+        existing_query = existing_query.filter(collection_overview_slot.shop_display_id == target_shop_display_id)
+
+    existing_query.delete()
+    now = datetime.now()
+    for slot in payload.slots:
+        session.add(
+            collection_overview_slot(
+                shop_id=target_shop_id,
+                shop_display_id=target_shop_display_id,
+                collection_id=slot.collection_id,
+                slot_position=slot.slot_position,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    session.commit()
+    return {"message": "Overview slots saved"}
+
+
 def _apply_attribute_option_filters(base_query, attribute_option_ids: list[int], session: Session):
     normalized_ids = sorted({int(v) for v in attribute_option_ids if isinstance(v, int) or str(v).isdigit()})
     if not normalized_ids:
@@ -980,7 +1611,6 @@ def get_products(
 
     total_count = prod_q.count()
     offset = (page - 1) * page_size
-    view_counts = {}
     if sort_by == "most-viewed":
         views_subq = (
             session.query(
@@ -998,7 +1628,6 @@ def get_products(
             .limit(page_size)
             .all()
         )
-        view_counts = get_entity_view_counts(session, "product", [p.id for p in rows])
     else:
         rows = (
             _apply_sort(prod_q, sort_by)
@@ -1006,9 +1635,8 @@ def get_products(
             .limit(page_size)
             .all()
         )
-        if view_count:
-            view_counts = get_entity_view_counts(session, "product", [p.id for p in rows])
 
+    view_counts = get_entity_view_counts(session, "product", [p.id for p in rows]) if rows else {}
     items = [_serialize_listing_product(session, p, view_count=view_counts.get(p.id, 0)) for p in rows]
 
     if track_view:

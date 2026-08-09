@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import uvicorn
 import os
-from sqlalchemy import inspect, text
+from sqlalchemy import text
 
 from db.database import db
 from api.products import products_router
@@ -19,29 +19,9 @@ from fastapi import Request
 from utils.auth import verify_token
 from db.db_models import user as UserModel, shop as ShopModel, announcement_banner as AnnouncementBannerModel
 
-
-def _ensure_shop_city_column() -> None:
-    """Backfill schema for existing databases that were created before `shops.city` existed."""
-    engine = db.get_engine()
-    inspector = inspect(engine)
-    columns = {c["name"] for c in inspector.get_columns("shops")}
-    if "city" in columns:
-        return
-
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE shops ADD COLUMN city VARCHAR(120)"))
-
-
-def _ensure_announcement_banners_table() -> None:
-    """Create `announcement_banners` for existing databases if missing."""
-    engine = db.get_engine()
-    AnnouncementBannerModel.__table__.create(bind=engine, checkfirst=True)
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.connect()
-    _ensure_shop_city_column()
-    _ensure_announcement_banners_table()
     try:
         yield
     finally:
