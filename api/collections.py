@@ -893,8 +893,9 @@ def _shop_collection_display_on_homepage(session: Session, collection_id: int, s
     override = _get_shop_homepage_display(session, collection_id, shop_id)
     if override is not None:
         return override.display_on_homepage
-    c = session.query(collection).filter(collection.id == collection_id).first()
-    return bool(c and c.display_on_homepage)
+    # For shop-scoped system collection views, homepage display should be controlled per shop.
+    # Global system collection homepage visibility should not automatically enable the collection for every shop.
+    return False
 
 
 def _shop_collection_homepage_order(session: Session, collection_id: int, shop_id: int) -> int:
