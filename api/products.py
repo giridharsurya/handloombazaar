@@ -27,6 +27,17 @@ from api.analytics import get_entity_view_counts, track_entity_view
 import uuid
 from datetime import datetime
 
+allowed_image_mime_types = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"}
+allowed_image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
+
+
+def validate_upload_file(uf: UploadFile):
+    content_type = getattr(uf, "content_type", "") or ""
+    if content_type.lower() in allowed_image_mime_types:
+        return True
+    suffix = Path(getattr(uf, "filename", "")).suffix.lower()
+    return suffix in allowed_image_extensions
+
 
 products_router = APIRouter(prefix="/api/products", tags=["Products"])
 
@@ -1228,6 +1239,8 @@ async def update_product(
                 if not isinstance(loaded_image_urls, list) or any(not isinstance(item, str) for item in loaded_image_urls):
                     raise HTTPException(status_code=422, detail="image_urls must be a string list")
                 parsed_image_urls = [item for item in loaded_image_urls if item]
+                if len(parsed_image_urls) > 5:
+                    raise HTTPException(status_code=400, detail="Maximum 5 images can be uploaded.")
 
         if "primary_image_index" in form:
             primary_raw = form.get("primary_image_index")
@@ -1245,9 +1258,14 @@ async def update_product(
                 upload_files.append(value)
 
         if upload_files:
+            if len(upload_files) > 5:
+                raise HTTPException(status_code=400, detail="Maximum 5 images can be uploaded.")
+
             uploads_dir = Path("static") / "uploads"
             uploads_dir.mkdir(parents=True, exist_ok=True)
             for uf in upload_files:
+                if not validate_upload_file(uf):
+                    raise HTTPException(status_code=400, detail="Only JPG, PNG, WebP, GIF, and AVIF image formats are allowed.")
                 orig = getattr(uf, "filename", "upload")
                 ext = Path(orig).suffix or ""
                 fname = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}{ext}"
@@ -1357,6 +1375,8 @@ async def update_product(
                 raise HTTPException(status_code=422, detail="image_urls must be a string list")
             else:
                 parsed_image_urls = [item for item in image_urls if item]
+                if len(parsed_image_urls) > 5:
+                    raise HTTPException(status_code=400, detail="Maximum 5 images can be uploaded.")
 
         if "primary_image_index" in body:
             incoming_primary_index = body.get("primary_image_index")
@@ -1526,11 +1546,16 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
             if k == "images" and hasattr(v, "filename"):
                 upload_files.append(v)
 
+        if len(upload_files) > 5:
+            raise HTTPException(status_code=400, detail="Maximum 5 images can be uploaded.")
+
         # save uploaded files into single uploads folder
         uploads_dir = Path("static") / "uploads"
         uploads_dir.mkdir(parents=True, exist_ok=True)
 
         for uf in upload_files:
+            if not validate_upload_file(uf):
+                raise HTTPException(status_code=400, detail="Only JPG, PNG, WebP, GIF, and AVIF image formats are allowed.")
             orig = getattr(uf, "filename", "upload")
             ext = Path(orig).suffix or ""
             fname = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}{ext}"
@@ -1595,6 +1620,9 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
         stock_quantity = int(payload.stock_quantity)
         images_urls = payload.images or []
         parsed_attributes = payload.attributes or []
+
+        if len(images_urls) > 5:
+            raise HTTPException(status_code=400, detail="Maximum 5 images can be uploaded.")
 
     shop_row = session.query(shop).filter(shop.display_id == shop_display_id).first()
     if not shop_row:
