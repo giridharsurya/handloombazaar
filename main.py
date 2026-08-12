@@ -15,6 +15,7 @@ from api.auth import auth_router
 from api.shops import shops_router
 from api.collections import router as collections_router
 from api.announcements import announcements_router
+from api.analytics import analytics_router
 from fastapi import Request
 from utils.auth import verify_token
 from db.db_models import user as UserModel, shop as ShopModel, announcement_banner as AnnouncementBannerModel
@@ -107,6 +108,7 @@ app.include_router(auth_router)
 app.include_router(shops_router)
 app.include_router(collections_router)
 app.include_router(announcements_router)
+app.include_router(analytics_router)
 
 @app.get("/health")
 async def health():

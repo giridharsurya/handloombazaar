@@ -1641,7 +1641,18 @@ def get_products(
     items = [_serialize_listing_product(session, p, view_count=view_counts.get(p.id, 0)) for p in rows]
 
     if track_view:
-        track_entity_view(session, request, response, "collection", collection_id)
+        is_shop_scope_view = bool(
+            shop_display_id is not None
+            or (is_shop_bound and vendor_shop_row is not None)
+            or bool(owned_sc_rows)
+        )
+        track_entity_view(
+            session,
+            request,
+            response,
+            "shop_collection" if is_shop_scope_view else "system_collection",
+            collection_id,
+        )
 
     data = {
         "page": page,

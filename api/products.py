@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from starlette.datastructures import UploadFile
 from pathlib import Path
 import shutil
-from sqlalchemy import and_, exists, func, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from db.database import get_session
@@ -29,6 +29,70 @@ from datetime import datetime
 
 allowed_image_mime_types = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"}
 allowed_image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
+
+
+def _build_product_search_conditions(search: Optional[str]) -> list[str]:
+    if not search:
+        return []
+
+    normalized = " ".join(search.strip().split())
+    if not normalized:
+        return []
+
+    normalized = normalized.lower()
+    terms = [term.lower() for term in normalized.split() if term]
+    return [normalized, *terms]
+
+
+def _build_product_search_filters(search: Optional[str]):
+    if not search:
+        return None, None, None, None
+
+    normalized = " ".join(search.strip().split())
+    if not normalized:
+        return None, None, None, None
+
+    normalized_lower = normalized.lower()
+    terms = [term.lower() for term in normalized.split() if term]
+
+    exact_match = or_(
+        func.lower(product.name) == normalized_lower,
+        func.lower(product.display_id) == normalized_lower,
+    )
+
+    phrase_match = or_(
+        product.name.ilike(f"%{normalized}%"),
+        product.display_id.ilike(f"%{normalized}%"),
+    )
+
+    if len(terms) == 1:
+        word_match = or_(
+            product.name.ilike(f"%{terms[0]}%"),
+            product.display_id.ilike(f"%{terms[0]}%"),
+        )
+        return exact_match, phrase_match, word_match, word_match
+
+    all_words_match = and_(
+        *[
+            or_(
+                product.name.ilike(f"%{term}%"),
+                product.display_id.ilike(f"%{term}%"),
+            )
+            for term in terms
+        ]
+    )
+
+    any_words_match = or_(
+        *[
+            or_(
+                product.name.ilike(f"%{term}%"),
+                product.display_id.ilike(f"%{term}%"),
+            )
+            for term in terms
+        ]
+    )
+
+    return exact_match, phrase_match, all_words_match, any_words_match
 
 
 def validate_upload_file(uf: UploadFile):
@@ -401,6 +465,28 @@ def _apply_attribute_option_filters(base_query, attribute_option_ids: list[int],
     return base_query
 
 
+def _build_attribute_match_exists(attribute_rows: list[tuple[int, int]]):
+    if not attribute_rows:
+        return None
+
+    conditions = [
+        and_(
+            product_attribute.attribute_definition_id == definition_id,
+            product_attribute.attribute_option_id == option_id,
+        )
+        for definition_id, option_id in attribute_rows
+    ]
+
+    return exists(
+        select(product_attribute.id).where(
+            and_(
+                product_attribute.product_id == product.id,
+                or_(*conditions),
+            )
+        )
+    )
+
+
 def _apply_sort(base_query, sort_by: Literal["newest", "price-low", "price-high", "most-viewed"]):
     if sort_by == "price-low":
         return base_query.order_by(func.coalesce(product.discount_price, product.price).asc(), product.id.desc())
@@ -432,6 +518,7 @@ def get_products(
         default=[],
         description="Repeat query param as attribute_filters=Color:Red&attribute_filters=Size:M",
     ),
+    product_group_id: Optional[int] = Query(None, ge=1),
     session: Session = Depends(get_session),
 ):
     offset = (page - 1) * page_size
@@ -479,14 +566,32 @@ def get_products(
         raise HTTPException(status_code=403, detail="Invalid role")
 
     if search:
-        base_query = base_query.filter(product.name.ilike(f"%{search.strip()}%"))
-
+        search_text = " ".join(search.strip().split())
+        if search_text:
+            exact_match, phrase_match, all_words_match, any_words_match = _build_product_search_filters(search_text)
+            if exact_match is not None:
+                exact_exists = session.query(exists().where(exact_match)).scalar()
+                if exact_exists:
+                    base_query = base_query.filter(exact_match)
+                elif phrase_match is not None:
+                    phrase_exists = session.query(exists().where(phrase_match)).scalar()
+                    if phrase_exists:
+                        base_query = base_query.filter(phrase_match)
+                    elif all_words_match is not None:
+                        all_words_exists = session.query(exists().where(all_words_match)).scalar()
+                        if all_words_exists:
+                            base_query = base_query.filter(all_words_match)
+                        elif any_words_match is not None:
+                            base_query = base_query.filter(any_words_match)
 
     if min_price is not None:
         base_query = base_query.filter(func.coalesce(product.discount_price, product.price) >= min_price)
 
     if max_price is not None:
         base_query = base_query.filter(func.coalesce(product.discount_price, product.price) <= max_price)
+
+    if product_group_id is not None:
+        base_query = base_query.filter(product.product_group_id == product_group_id)
 
     base_query = _apply_attribute_option_filters(base_query, attribute_option_ids, session)
     base_query = _apply_attribute_filters(base_query, attribute_filters)
@@ -728,6 +833,117 @@ def get_product_variants(
         items.append(ProductListItem(**row))
 
     return ProductVariantsResponse(success=True, message="Product variants retrieved successfully", data=items)
+
+
+@products_router.get("/{product_id}/similar-from-shop", response_model=ProductVariantsResponse)
+def get_similar_products_from_shop(
+    request: Request,
+    product_id: str,
+    session: Session = Depends(get_session),
+):
+    current_user: Optional[UserModel] = getattr(request.state, "current_user", None)
+
+    q = session.query(product).filter(product.display_id == product_id)
+    if current_user is None or current_user.role == UserRole.USER:
+        q = q.filter(product.is_active.is_(True), product.stock_quantity > 0)
+    elif current_user.role == UserRole.SHOP_OWNER:
+        shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if not shop_row:
+            raise HTTPException(status_code=404, detail="Product not found")
+        q = q.filter(product.shop_id == shop_row.id)
+    elif current_user.role == UserRole.ADMIN:
+        pass
+    else:
+        raise HTTPException(status_code=403, detail="Invalid role")
+
+    selected_product = q.first()
+    if selected_product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    attribute_rows = (
+        session.query(product_attribute.attribute_definition_id, product_attribute.attribute_option_id)
+        .filter(product_attribute.product_id == selected_product.id)
+        .all()
+    )
+
+    similar_query = session.query(product).filter(
+        product.id != selected_product.id,
+        product.shop_id == selected_product.shop_id,
+    )
+    if current_user is None or current_user.role == UserRole.USER:
+        similar_query = similar_query.filter(product.is_active.is_(True), product.stock_quantity > 0)
+
+    attribute_exists = _build_attribute_match_exists(attribute_rows)
+    if attribute_exists is not None:
+        similar_query = similar_query.filter(attribute_exists)
+
+    similar_products = similar_query.order_by(product.created_at.desc()).limit(12).all()
+    similar_ids = [p.id for p in similar_products]
+    view_counts = get_entity_view_counts(session, "product", similar_ids) if similar_ids else {}
+
+    items = [ProductListItem(**_serialize_listing_product(session, p, view_count=view_counts.get(p.id, 0))) for p in similar_products]
+
+    return ProductVariantsResponse(success=True, message="Similar products retrieved successfully", data=items)
+
+
+@products_router.get("/{product_id}/similar-from-other-shops", response_model=ProductVariantsResponse)
+def get_similar_products_from_other_shops(
+    request: Request,
+    product_id: str,
+    session: Session = Depends(get_session),
+):
+    current_user: Optional[UserModel] = getattr(request.state, "current_user", None)
+
+    q = session.query(product).filter(product.display_id == product_id)
+    if current_user is None or current_user.role == UserRole.USER:
+        q = q.filter(product.is_active.is_(True), product.stock_quantity > 0)
+    elif current_user.role == UserRole.SHOP_OWNER:
+        shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if not shop_row:
+            raise HTTPException(status_code=404, detail="Product not found")
+        q = q.filter(product.shop_id == shop_row.id)
+    elif current_user.role == UserRole.ADMIN:
+        pass
+    else:
+        raise HTTPException(status_code=403, detail="Invalid role")
+
+    selected_product = q.first()
+    if selected_product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    attribute_rows = (
+        session.query(product_attribute.attribute_definition_id, product_attribute.attribute_option_id)
+        .filter(product_attribute.product_id == selected_product.id)
+        .all()
+    )
+
+    similar_query = session.query(product).filter(
+        product.id != selected_product.id,
+        product.shop_id != selected_product.shop_id,
+    )
+    if current_user is None or current_user.role == UserRole.USER:
+        similar_query = similar_query.filter(product.is_active.is_(True), product.stock_quantity > 0)
+
+    attribute_exists = _build_attribute_match_exists(attribute_rows)
+    if attribute_exists is not None:
+        similar_query = similar_query.filter(attribute_exists)
+
+    similar_products = similar_query.order_by(product.created_at.desc()).limit(12).all()
+    if not similar_products:
+        fallback_query = session.query(product).filter(
+            product.id != selected_product.id,
+            product.shop_id != selected_product.shop_id,
+        )
+        if current_user is None or current_user.role == UserRole.USER:
+            fallback_query = fallback_query.filter(product.is_active.is_(True), product.stock_quantity > 0)
+        similar_products = fallback_query.order_by(product.created_at.desc()).limit(12).all()
+
+    similar_ids = [p.id for p in similar_products]
+    view_counts = get_entity_view_counts(session, "product", similar_ids) if similar_ids else {}
+
+    items = [ProductListItem(**_serialize_listing_product(session, p, view_count=view_counts.get(p.id, 0))) for p in similar_products]
+
+    return ProductVariantsResponse(success=True, message="Similar products retrieved successfully", data=items)
 
 
 @products_router.post("/bulk-update-attributes", response_model=BulkUpdateProductAttributesResponse)
