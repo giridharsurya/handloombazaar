@@ -116,7 +116,7 @@ class ProductListItem(BaseModel):
     price: int
     discount_price: int | None
     stock_quantity: int
-    is_active: bool
+    is_active: bool | None = None
     created_at: datetime
     updated_at: datetime
     view_count: int = 0
@@ -829,7 +829,7 @@ def get_product_variants(
     for p in variants:
         row = _serialize_listing_product(session, p, view_count=view_counts.get(p.id, 0))
         if current_user is None:
-            row.pop("is_active", None)
+            row["is_active"] = None
         items.append(ProductListItem(**row))
 
     return ProductVariantsResponse(success=True, message="Product variants retrieved successfully", data=items)

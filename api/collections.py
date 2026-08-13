@@ -169,7 +169,8 @@ def list_collections(
 
     collection_ids = [r.id for r in rows]
     counts = get_entity_view_counts(session, "collection", collection_ids) if (view_count or sort_by == "most-viewed") else {}
-    product_counts = _get_collection_product_counts(session, collection_ids) if sort_by == "product-count" else {}
+    product_counts = _get_collection_product_counts(session, collection_ids)
+    rows = [r for r in rows if product_counts.get(r.id, 0) > 0]
 
     if k == "system" and shop_display_id:
         filtered_rows = []

@@ -397,10 +397,144 @@ class ShopAnalyticsResponse(BaseModel):
     top_collections: list[ShopAnalyticsTopItem]
 
 
+class AdminAnalyticsSummaryResponse(BaseModel):
+    site_visitor_count: int
+    system_collection_views: int
+    shop_views: int
+    total_shops: int
+    top_shops: list[ShopAnalyticsTopItem]
+    top_system_collections: list[ShopAnalyticsTopItem]
+
+
+class AdminAnalyticsResponse(BaseModel):
+    period: str
+    summary: AdminAnalyticsSummaryResponse
+    selected_shop: Optional[ShopAnalyticsResponse] = None
+
+
 @analytics_router.post("/homepage/visit", response_model=HomepageVisitResponse)
 def track_homepage_visit(request: Request, response: Response, session: Session = Depends(get_session)):
     track_entity_view(session, request, response, "homepage", 1)
     return HomepageVisitResponse(success=True, message="Homepage visit tracked", entity_type="homepage", entity_id=1)
+
+
+@analytics_router.get("/admin", response_model=AdminAnalyticsResponse)
+def get_admin_analytics(
+    period: str = Query(default="all"),
+    month: Optional[str] = Query(default=None),
+    year: Optional[str] = Query(default=None),
+    from_date: Optional[str] = Query(default=None),
+    to_date: Optional[str] = Query(default=None),
+    shop_display_id: Optional[str] = Query(default=None),
+    request: Request = None,
+    session: Session = Depends(get_session),
+):
+    current_user = getattr(request.state, "current_user", None)
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    start_datetime = _resolve_start_datetime(period, month=month, year=year, from_date=from_date, to_date=to_date)
+    end_datetime = _resolve_end_datetime(period, month=month, year=year, from_date=from_date, to_date=to_date)
+
+    def filter_by_period(query):
+        if start_datetime is not None:
+            query = query.filter(unique_visit.last_viewed_at >= start_datetime)
+        if end_datetime is not None:
+            query = query.filter(unique_visit.last_viewed_at <= end_datetime)
+        return query
+
+    site_visitor_query = session.query(unique_visit.visitor_id).filter(unique_visit.entity_type == "homepage")
+    if start_datetime is not None:
+        site_visitor_query = site_visitor_query.filter(unique_visit.last_viewed_at >= start_datetime)
+    if end_datetime is not None:
+        site_visitor_query = site_visitor_query.filter(unique_visit.last_viewed_at <= end_datetime)
+    site_visitor_count = int(site_visitor_query.distinct().count())
+
+    system_collection_ids = [
+        row[0] for row in session.query(collection.id)
+        .filter(collection.is_active.is_(True))
+        .outerjoin(shop_collection, shop_collection.collection_id == collection.id)
+        .filter(shop_collection.id.is_(None))
+        .all()
+    ]
+    system_collection_views = int(
+        filter_by_period(
+            session.query(func.coalesce(func.sum(unique_visit.visit_count), 0))
+            .filter(unique_visit.entity_type == "system_collection", unique_visit.entity_id.in_(system_collection_ids))
+        ).scalar()
+        or 0
+    ) if system_collection_ids else 0
+
+    shop_views = int(
+        filter_by_period(
+            session.query(func.coalesce(func.sum(unique_visit.visit_count), 0))
+            .filter(unique_visit.entity_type == "shop")
+        ).scalar() or 0
+    )
+
+    total_shops = session.query(shop).filter(shop.is_active.is_(True), shop.approved.is_(True)).count()
+
+    top_shops = (
+        filter_by_period(
+            session.query(shop.name.label("shop_name"), func.sum(unique_visit.visit_count).label("view_count"))
+            .join(shop, shop.id == unique_visit.entity_id)
+            .filter(unique_visit.entity_type == "shop")
+            .group_by(shop.name)
+            .order_by(func.sum(unique_visit.visit_count).desc(), shop.name.asc())
+            .limit(10)
+        ).all()
+    )
+
+    top_system_collections = (
+        filter_by_period(
+            session.query(
+                collection.name.label("collection_name"),
+                func.sum(unique_visit.visit_count).label("view_count"),
+            )
+            .join(collection, collection.id == unique_visit.entity_id)
+            .filter(
+                unique_visit.entity_type == "system_collection",
+                unique_visit.entity_id.in_(system_collection_ids),
+            )
+            .group_by(collection.name)
+            .order_by(func.sum(unique_visit.visit_count).desc(), collection.name.asc())
+            .limit(10)
+        ).all()
+    )
+
+    selected_shop_data = None
+    if shop_display_id:
+        selected_shop_data = get_shop_analytics(
+            shop_display_id,
+            period=period,
+            month=month,
+            year=year,
+            from_date=from_date,
+            to_date=to_date,
+            request=request,
+            session=session,
+        )
+
+    return AdminAnalyticsResponse(
+        period=period.lower(),
+        summary=AdminAnalyticsSummaryResponse(
+            site_visitor_count=site_visitor_count,
+            system_collection_views=system_collection_views,
+            shop_views=shop_views,
+            total_shops=total_shops,
+            top_shops=[
+                ShopAnalyticsTopItem(name=row.shop_name, value="shop", view_count=int(row.view_count))
+                for row in top_shops
+            ],
+            top_system_collections=[
+                ShopAnalyticsTopItem(name=row.collection_name, value="system_collection", view_count=int(row.view_count))
+                for row in top_system_collections
+            ],
+        ),
+        selected_shop=selected_shop_data,
+    )
 
 
 @analytics_router.get("/shop/{display_id}", response_model=ShopAnalyticsResponse)

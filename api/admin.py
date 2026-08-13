@@ -11,9 +11,11 @@ from db.db_models import (
     attribute_definition,
     attribute_option,
     collection,
+    collection_shop,
     product,
     product_attribute,
     shop,
+    shop_collection,
     UserRole,
 )
 
@@ -166,6 +168,102 @@ def reject_shop(shop_id: int, session: Session = Depends(get_session)):
             "approved": selected_shop.approved,
         },
     }
+
+
+def deactivate_shop(shop_id: int, session: Session):
+    selected_shop = session.query(shop).filter(shop.id == shop_id).first()
+    if selected_shop is None:
+        raise HTTPException(status_code=404, detail="Shop not found")
+
+    now = datetime.now()
+    selected_shop.is_active = False
+    selected_shop.approved = False
+    selected_shop.updated_at = now
+
+    affected_products = session.query(product).filter(product.shop_id == shop_id).all()
+    for product_row in affected_products:
+        product_row.is_active = False
+        product_row.updated_at = now
+
+    related_collection_links = session.query(shop_collection).filter(shop_collection.shop_id == shop_id).all()
+    for shop_collection_row in related_collection_links:
+        shop_collection_row.is_active = False
+        shop_collection_row.updated_at = now
+
+        linked_collection = session.query(collection).filter(collection.id == shop_collection_row.collection_id).first()
+        if linked_collection is not None:
+            linked_collection.is_active = False
+            linked_collection.updated_at = now
+
+    collection_rows = session.query(collection).join(collection_shop, collection.id == collection_shop.collection_id).filter(collection_shop.shop_id == shop_id).all()
+    for collection_row in collection_rows:
+        collection_row.is_active = False
+        collection_row.updated_at = now
+
+    session.commit()
+    session.refresh(selected_shop)
+    return {
+        "message": "Shop deactivated successfully",
+        "shop": {
+            "id": selected_shop.id,
+            "name": selected_shop.name,
+            "is_active": selected_shop.is_active,
+            "approved": selected_shop.approved,
+        },
+    }
+
+
+def reactivate_shop(shop_id: int, session: Session):
+    selected_shop = session.query(shop).filter(shop.id == shop_id).first()
+    if selected_shop is None:
+        raise HTTPException(status_code=404, detail="Shop not found")
+
+    now = datetime.now()
+    selected_shop.is_active = True
+    selected_shop.approved = True
+    selected_shop.updated_at = now
+
+    affected_products = session.query(product).filter(product.shop_id == shop_id).all()
+    for product_row in affected_products:
+        product_row.is_active = True
+        product_row.updated_at = now
+
+    related_collection_links = session.query(shop_collection).filter(shop_collection.shop_id == shop_id).all()
+    for shop_collection_row in related_collection_links:
+        shop_collection_row.is_active = True
+        shop_collection_row.updated_at = now
+
+        linked_collection = session.query(collection).filter(collection.id == shop_collection_row.collection_id).first()
+        if linked_collection is not None:
+            linked_collection.is_active = True
+            linked_collection.updated_at = now
+
+    collection_rows = session.query(collection).join(collection_shop, collection.id == collection_shop.collection_id).filter(collection_shop.shop_id == shop_id).all()
+    for collection_row in collection_rows:
+        collection_row.is_active = True
+        collection_row.updated_at = now
+
+    session.commit()
+    session.refresh(selected_shop)
+    return {
+        "message": "Shop reactivated successfully",
+        "shop": {
+            "id": selected_shop.id,
+            "name": selected_shop.name,
+            "is_active": selected_shop.is_active,
+            "approved": selected_shop.approved,
+        },
+    }
+
+
+@admin_router.post("/shops/{shop_id}/deactivate")
+def deactivate_shop_route(shop_id: int, session: Session = Depends(get_session)):
+    return deactivate_shop(shop_id, session)
+
+
+@admin_router.post("/shops/{shop_id}/reactivate")
+def reactivate_shop_route(shop_id: int, session: Session = Depends(get_session)):
+    return reactivate_shop(shop_id, session)
 
 
 @admin_router.post("/collections")

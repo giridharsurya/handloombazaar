@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from api.analytics import _get_period_config, _resolve_start_datetime
+from api.analytics import AdminAnalyticsSummaryResponse, _get_period_config, _resolve_start_datetime
 
 
 def test_week_period_config_is_7_days():
@@ -32,3 +32,19 @@ def test_invalid_period_defaults_to_month():
 def test_custom_date_range_uses_from_and_to_filters():
     start = _resolve_start_datetime("custom", from_date="2025-01-10", to_date="2025-01-20")
     assert start == datetime(2025, 1, 10)
+
+
+def test_admin_analytics_summary_includes_top_system_collections():
+    payload = {
+        "site_visitor_count": 10,
+        "system_collection_views": 45,
+        "shop_views": 25,
+        "total_shops": 8,
+        "top_shops": [{"name": "Shop A", "value": "shop", "view_count": 12}],
+        "top_system_collections": [{"name": "Festive Edit", "value": "system_collection", "view_count": 20}],
+    }
+
+    summary = AdminAnalyticsSummaryResponse(**payload)
+
+    assert summary.top_system_collections[0].name == "Festive Edit"
+    assert summary.top_system_collections[0].view_count == 20
