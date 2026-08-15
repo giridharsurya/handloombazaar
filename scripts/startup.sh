@@ -11,6 +11,10 @@ if [ -z "$PYTHON_BIN" ]; then
   PYTHON_BIN="python"
 fi
 
+if [ -f "requirements.txt" ]; then
+  "$PYTHON_BIN" -m pip install --disable-pip-version-check -r requirements.txt
+fi
+
 "$PYTHON_BIN" scripts/run_migrations.py
 
 PORT="${PORT:-8000}"

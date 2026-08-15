@@ -1,0 +1,61 @@
+I’ll give you the exact Azure PostgreSQL user creation steps for an app login without assigning DB roles beyond what the app needs.
+
+## Create a dedicated app login user
+
+Use this in Azure PostgreSQL as the admin user:
+
+```sql
+CREATE USER handloombazaar_app WITH
+  LOGIN
+  PASSWORD 'StrongPassword123!'
+  NOSUPERUSER
+  NOCREATEDB
+  NOCREATEROLE
+  NOINHERIT;
+
+CREATE DATABASE handloombazaar;
+
+GRANT CONNECT ON DATABASE handloombazaar TO handloombazaar_app;
+```
+
+Then connect to the new database and grant only app-level access:
+
+```sql
+\c handloombazaar
+
+GRANT USAGE ON SCHEMA public TO handloombazaar_app;
+
+-- if the app only reads/writes tables:
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO handloombazaar_app;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO handloombazaar_app;
+
+-- so future tables also get these permissions:
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO handloombazaar_app;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO handloombazaar_app;
+```
+
+If the app must create tables itself, then also add:
+
+```sql
+GRANT CREATE ON SCHEMA public TO handloombazaar_app;
+```
+
+---
+
+## Example app connection string
+
+```env
+DATABASE_CONNECTION_STRING=postgresql://handloombazaar_app:StrongPassword123!@handloombazaar-dev-server.postgres.database.azure.com:5432/handloombazaar_db?sslmode=require
+```
+
+This gives the app:
+- login access
+- no admin privileges
+- no role creation
+- no DB creation
+- only the permissions needed for normal app operations
+
+> If you want, I can give you the exact SQL to create a “read-only” user or a “full app write” user depending on whether your app creates tables or just inserts/updates data.
