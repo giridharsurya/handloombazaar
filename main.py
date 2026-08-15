@@ -3,6 +3,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import logging
 import uvicorn
 import os
 from dotenv import load_dotenv
@@ -11,6 +12,7 @@ from sqlalchemy import text
 load_dotenv()
 
 from db.database import db
+from scripts.run_migrations import run_migrations
 from api.products import products_router
 from api.create import create_router
 from api.admin import admin_router
@@ -23,10 +25,13 @@ from fastapi import Request
 from utils.auth import verify_token
 from db.db_models import user as UserModel, shop as ShopModel, announcement_banner as AnnouncementBannerModel
 
+logger = logging.getLogger(__name__)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.connect()
     try:
+        run_migrations()
         yield
     finally:
         db.disconnect()

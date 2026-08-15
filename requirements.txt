@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 python-dotenv
+python-multipart
 sqlalchemy
 psycopg2-binary
 pyodbc

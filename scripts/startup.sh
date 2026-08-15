@@ -5,17 +5,7 @@ cd "$(dirname "$0")/.."
 
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
-PYTHON_BIN="${PYTHON_BIN:-$(find /tmp -path '*/antenv/bin/python' -type f 2>/dev/null | head -n 1)}"
-
-if [ -z "$PYTHON_BIN" ]; then
-  PYTHON_BIN="python"
-fi
-
-if [ -f "requirements.txt" ]; then
-  "$PYTHON_BIN" -m pip install --disable-pip-version-check -r requirements.txt
-fi
-
-"$PYTHON_BIN" scripts/run_migrations.py
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 PORT="${PORT:-8000}"
 exec "$PYTHON_BIN" -m uvicorn main:app --host 0.0.0.0 --port "$PORT"
