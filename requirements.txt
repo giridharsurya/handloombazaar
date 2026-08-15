@@ -6,3 +6,6 @@ pyodbc
 PyJWT
 bcrypt
 email-validator
+azure-identity
+azure-storage-blob
+pytest
