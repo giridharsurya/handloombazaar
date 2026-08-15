@@ -24,6 +24,7 @@ from db.db_models import (
     UserRole,
 )
 from api.analytics import get_entity_view_counts, track_entity_view
+from utils.blob_storage import upload_product_image_to_blob, delete_blob_by_url
 import uuid
 from datetime import datetime
 
@@ -393,6 +394,41 @@ def _serialize_product_detail(session: Session, item: product, view_count: int =
             for _, definition, option in attribute_rows
         ],
     }
+
+
+def _ensure_required_attributes_selected(session: Session, selected_by_definition: dict[int, int] | list[dict] | None):
+    required_rows = (
+        session.query(attribute_definition)
+        .filter(attribute_definition.is_active.is_(True), attribute_definition.is_required.is_(True))
+        .all()
+    )
+    if not required_rows:
+        return
+
+    selected_ids: set[int] = set()
+    if isinstance(selected_by_definition, dict):
+        for definition_id, option_id in selected_by_definition.items():
+            if definition_id is None or option_id in (None, ""):
+                continue
+            try:
+                selected_ids.add(int(definition_id))
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(selected_by_definition, list):
+        for row in selected_by_definition:
+            if not isinstance(row, dict):
+                continue
+            definition_id = row.get("definition_id")
+            if definition_id is None:
+                continue
+            try:
+                selected_ids.add(int(definition_id))
+            except (TypeError, ValueError):
+                continue
+
+    missing = [row.attribute_name for row in required_rows if row.id not in selected_ids]
+    if missing:
+        raise HTTPException(status_code=422, detail=f"Required attributes missing: {', '.join(missing)}")
 
 
 def _apply_attribute_filters(base_query, attribute_filters: list[str]):
@@ -1159,6 +1195,10 @@ async def bulk_product_action(
 
     elif payload.action == "delete_products":
         for p in target_products:
+            image_rows = session.query(product_image).filter(product_image.product_id == p.id).all()
+            for row in image_rows:
+                delete_blob_by_url(row.image_url)
+            session.query(product_image).filter(product_image.product_id == p.id).delete(synchronize_session=False)
             session.delete(p)
 
     session.commit()
@@ -1477,19 +1517,30 @@ async def update_product(
             if len(upload_files) > 5:
                 raise HTTPException(status_code=400, detail="Maximum 5 images can be uploaded.")
 
-            uploads_dir = Path("static") / "uploads"
-            uploads_dir.mkdir(parents=True, exist_ok=True)
+            owner_shop = session.query(shop).filter(shop.id == target_product.shop_id).first()
+            if owner_shop is None:
+                raise HTTPException(status_code=404, detail="Shop not found")
+
             for uf in upload_files:
                 if not validate_upload_file(uf):
                     raise HTTPException(status_code=400, detail="Only JPG, PNG, WebP, GIF, and AVIF image formats are allowed.")
                 orig = getattr(uf, "filename", "upload")
-                ext = Path(orig).suffix or ""
-                fname = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}{ext}"
-                safe_path = uploads_dir / fname
                 try:
-                    with safe_path.open("wb") as out_file:
-                        shutil.copyfileobj(uf.file, out_file)
-                    uploaded_image_urls.append(f"/static/uploads/{fname}")
+                    if hasattr(uf.file, "seek"):
+                        uf.file.seek(0)
+                    uploaded_image_urls.append(
+                        upload_product_image_to_blob(
+                            uf.file,
+                            owner_shop.display_id,
+                            target_product.display_id,
+                            orig,
+                            shop_name=owner_shop.name,
+                            city=owner_shop.city,
+                            shop_created_at=owner_shop.created_at,
+                            product_name=target_product.name,
+                            product_created_at=target_product.created_at,
+                        )
+                    )
                 finally:
                     try:
                         uf.file.close()
@@ -1639,6 +1690,8 @@ async def update_product(
                         detail=f"Attribute option {option_id} does not belong to definition {definition_id}",
                     )
 
+        _ensure_required_attributes_selected(session, dedup_by_definition)
+
         session.query(product_attribute).filter(product_attribute.product_id == target_product.id).delete(
             synchronize_session=False
         )
@@ -1664,6 +1717,10 @@ async def update_product(
             primary_image_index = 0
         if primary_image_index < 0 or primary_image_index >= len(final_urls):
             raise HTTPException(status_code=422, detail="primary_image_index is out of range")
+
+        existing_images = session.query(product_image).filter(product_image.product_id == target_product.id).all()
+        for row in existing_images:
+            delete_blob_by_url(row.image_url)
 
         session.query(product_image).filter(product_image.product_id == target_product.id).delete(
             synchronize_session=False
@@ -1746,55 +1803,22 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
 
     if content_type.startswith("multipart/form-data"):
         form = await request.form()
-        # Read fields (form values are strings)
         shop_display_id = form.get("shop_display_id")
         name = form.get("name")
         description = form.get("description")
         price_raw = form.get("price")
-        # accept alias 'discounted_price' as well
         discount_raw = form.get("discount_price") or form.get("discounted_price")
         stock_raw = form.get("stock_quantity")
         attributes_raw = form.get("attributes")
 
-        # collect uploaded files from repeated 'images' fields
-        upload_files: list[UploadFile] = []
-        for k, v in form.multi_items():
-            if k == "images" and hasattr(v, "filename"):
-                upload_files.append(v)
-
-        if len(upload_files) > 5:
-            raise HTTPException(status_code=400, detail="Maximum 5 images can be uploaded.")
-
-        # save uploaded files into single uploads folder
-        uploads_dir = Path("static") / "uploads"
-        uploads_dir.mkdir(parents=True, exist_ok=True)
-
-        for uf in upload_files:
-            if not validate_upload_file(uf):
-                raise HTTPException(status_code=400, detail="Only JPG, PNG, WebP, GIF, and AVIF image formats are allowed.")
-            orig = getattr(uf, "filename", "upload")
-            ext = Path(orig).suffix or ""
-            fname = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}{ext}"
-            safe_path = uploads_dir / fname
-            try:
-                with safe_path.open("wb") as out_file:
-                    shutil.copyfileobj(uf.file, out_file)
-                images_urls.append(f"/static/uploads/{fname}")
-            finally:
-                try:
-                    uf.file.close()
-                except Exception:
-                    pass
-
-        # validate minimal required fields
         if not shop_display_id or not name or not price_raw or not stock_raw:
             raise HTTPException(status_code=422, detail="Missing required form fields")
 
-        # coerce numeric values
         try:
             price = int(price_raw)
         except Exception:
             raise HTTPException(status_code=422, detail="Invalid price value")
+
         try:
             stock_quantity = int(stock_raw)
         except Exception:
@@ -1816,10 +1840,16 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
                 raise HTTPException(status_code=422, detail="Attributes must be a list")
             parsed_attributes = loaded_attributes
 
+        upload_files: list[UploadFile] = []
+        for key, value in form.multi_items():
+            if key == "images" and hasattr(value, "filename"):
+                upload_files.append(value)
+
+        if len(upload_files) > 5:
+            raise HTTPException(status_code=400, detail="Maximum 5 images can be uploaded.")
+
     else:
-        # JSON body path
         body = await request.json()
-        # accept alias
         if "discounted_price" in body and "discount_price" not in body:
             body["discount_price"] = body.pop("discounted_price")
 
@@ -1840,29 +1870,35 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
         if len(images_urls) > 5:
             raise HTTPException(status_code=400, detail="Maximum 5 images can be uploaded.")
 
+        upload_files = []
+
     shop_row = session.query(shop).filter(shop.display_id == shop_display_id).first()
     if not shop_row:
         raise HTTPException(status_code=404, detail="Shop not found")
 
-    # role checks: vendor can create only for their own shop; admin can create for any
     if current_user.role == UserRole.SHOP_OWNER:
-        # ensure this vendor owns the shop
         if shop_row.owner_id != current_user.id:
             raise HTTPException(status_code=403, detail="Not authorized to create product for this shop")
-    elif current_user.role == UserRole.ADMIN:
-        pass
-    else:
+    elif current_user.role != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Insufficient privileges to create products")
 
     now = datetime.now()
 
-    if not images_urls or len(images_urls) == 0:
+    if content_type.startswith("multipart/form-data"):
+        if not upload_files:
+            raise HTTPException(status_code=400, detail="At least one image is required to create a product")
+
+        for uf in upload_files:
+            if not validate_upload_file(uf):
+                raise HTTPException(status_code=400, detail="Only JPG, PNG, WebP, GIF, and AVIF image formats are allowed.")
+
+    if not images_urls and not upload_files:
         raise HTTPException(status_code=400, detail="At least one image is required to create a product")
 
     p = product(
         shop_id=shop_row.id,
-        name=name,
-        description=description,
+        name=str(name).strip(),
+        description=str(description).strip() if description not in (None, "") else None,
         price=price,
         discount_price=discount_price,
         stock_quantity=stock_quantity,
@@ -1872,6 +1908,34 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
     )
     session.add(p)
     session.flush()
+
+    if content_type.startswith("multipart/form-data"):
+        for uf in upload_files:
+            orig = getattr(uf, "filename", "upload")
+            try:
+                if hasattr(uf.file, "seek"):
+                    uf.file.seek(0)
+                images_urls.append(
+                    upload_product_image_to_blob(
+                        uf.file,
+                        shop_row.display_id,
+                        p.display_id,
+                        orig,
+                        shop_name=shop_row.name,
+                        city=shop_row.city,
+                        shop_created_at=shop_row.created_at,
+                        product_name=p.name,
+                        product_created_at=p.created_at,
+                    )
+                )
+            finally:
+                try:
+                    uf.file.close()
+                except Exception:
+                    pass
+
+    if not images_urls or len(images_urls) == 0:
+        raise HTTPException(status_code=400, detail="At least one image is required to create a product")
 
     for idx, url in enumerate(images_urls):
         img = product_image(
@@ -1921,6 +1985,9 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
                     detail=f"Attribute option {option_id} does not belong to definition {definition_id}",
                 )
 
+        _ensure_required_attributes_selected(session, dedup_by_definition)
+
+        for definition_id, option_id in dedup_by_definition.items():
             session.add(
                 product_attribute(
                     product_id=p.id,
@@ -1930,6 +1997,9 @@ async def create_product(request: Request, session: Session = Depends(get_sessio
                     updated_at=now,
                 )
             )
+
+    else:
+        _ensure_required_attributes_selected(session, {})
 
     session.commit()
     data = {

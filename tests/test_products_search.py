@@ -6,7 +6,12 @@ import pytest
 
 from api.admin import deactivate_shop, reactivate_shop
 from api.collections import list_collections
-from api.products import _build_product_search_conditions, get_product_variants
+from api.products import (
+    _build_product_search_conditions,
+    _ensure_required_attributes_selected,
+    get_product_variants,
+)
+from api.shops import list_shops
 from db.database import get_session
 from db.db_models import (
     collection,
@@ -61,6 +66,146 @@ def test_exact_name_match_takes_priority_before_word_search():
     assert "like" in phrase_sql.lower()
     assert "and" in all_words_sql.lower()
     assert "or" in any_words_sql.lower()
+
+
+def test_ensure_required_attributes_selected_rejects_missing_required_definition():
+    session = next(get_session())
+    now = datetime.now()
+    unique = uuid.uuid4().hex[:8]
+
+    attrib = __import__("db.db_models", fromlist=["attribute_definition", "attribute_option"]).attribute_definition(
+        attribute_name=f"Required Color {unique}",
+        is_filterable=True,
+        is_required=True,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    session.add(attrib)
+    session.flush()
+
+    option = __import__("db.db_models", fromlist=["attribute_option"]).attribute_option(
+        attribute_definition_id=attrib.id,
+        option_value=f"Red {unique}",
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    session.add(option)
+    session.flush()
+
+    session.query(__import__("db.db_models", fromlist=["attribute_definition"]).attribute_definition).filter(
+        __import__("db.db_models", fromlist=["attribute_definition"]).attribute_definition.is_required.is_(True),
+        __import__("db.db_models", fromlist=["attribute_definition"]).attribute_definition.id != attrib.id,
+    ).update({"is_required": False}, synchronize_session=False)
+    session.commit()
+
+    with pytest.raises(Exception):
+        _ensure_required_attributes_selected(session, {})
+
+    _ensure_required_attributes_selected(session, {attrib.id: option.id})
+    session.close()
+
+
+def test_list_shops_only_returns_shops_with_active_products():
+    session = next(get_session())
+    now = datetime.now()
+    unique = uuid.uuid4().hex[:8]
+
+    owner_one = user(
+        username=f"public_listing_owner_one_{unique}",
+        email=f"public_listing_owner_one_{unique}@example.com",
+        password_hash="hash",
+        role=UserRole.SHOP_OWNER,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    owner_two = user(
+        username=f"public_listing_owner_two_{unique}",
+        email=f"public_listing_owner_two_{unique}@example.com",
+        password_hash="hash",
+        role=UserRole.SHOP_OWNER,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    session.add_all([owner_one, owner_two])
+    session.flush()
+
+    shop_with_product = shop(
+        owner_id=owner_one.id,
+        display_id=uuid.uuid4().hex[:8],
+        name=f"Visible Shop {unique}",
+        year_established=2020,
+        address="Main Street",
+        city="Test City",
+        phone_number="1234567890",
+        email=f"visible_{unique}@example.com",
+        website_url=None,
+        shop_logo_url="/images/logo.jpg",
+        youtube_url=None,
+        instagram_url=None,
+        facebook_url=None,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+        approved=True,
+    )
+    shop_without_product = shop(
+        owner_id=owner_two.id,
+        display_id=uuid.uuid4().hex[:8],
+        name=f"Hidden Shop {unique}",
+        year_established=2021,
+        address="Second Street",
+        city="Test City",
+        phone_number="1234567891",
+        email=f"hidden_{unique}@example.com",
+        website_url=None,
+        shop_logo_url="/images/logo.jpg",
+        youtube_url=None,
+        instagram_url=None,
+        facebook_url=None,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+        approved=True,
+    )
+    session.add_all([shop_with_product, shop_without_product])
+    session.flush()
+
+    session.add(
+        product(
+            display_id=uuid.uuid4().hex[:8],
+            shop_id=shop_with_product.id,
+            name=f"Visible Product {unique}",
+            price=150,
+            stock_quantity=12,
+            created_at=now,
+            updated_at=now,
+            is_active=True,
+        )
+    )
+    session.add(
+        product(
+            display_id=uuid.uuid4().hex[:8],
+            shop_id=shop_without_product.id,
+            name=f"Hidden Product {unique}",
+            price=200,
+            stock_quantity=5,
+            created_at=now,
+            updated_at=now,
+            is_active=False,
+        )
+    )
+    session.commit()
+
+    response = list_shops(page=1, page_size=20, sort_by="newest", session=session)
+
+    names = [item["name"] for item in response["items"]]
+    assert shop_with_product.name in names
+    assert shop_without_product.name not in names
+    session.close()
 
 
 def test_get_product_variants_for_anonymous_user_does_not_error():

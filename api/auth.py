@@ -5,6 +5,7 @@ from datetime import datetime
 from db.database import get_session
 from db.db_models import shop, user, UserRole
 from utils.auth import hash_password, verify_password, create_user_token, verify_token
+from utils.blob_storage import upload_image_to_shop_container
 import uuid
 
 auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -65,16 +66,13 @@ class TokenVerifyResponse(BaseModel):
 
 
 def _slugify(text: str) -> str:
-    """Convert text to kebab-case slug."""
-    return text.lower().replace(" ", "-").replace("_", "-")
+    """Convert text to a normalized slug, using underscores for spaces."""
+    return text.lower().replace(" ", "_").replace("_", "_")
 
 
 def _generate_display_id(name: str, prefix: str = "shop") -> str:
-    """Generate a unique display ID with timestamp."""
-    from datetime import datetime as dt
-    slug = _slugify(name)
-    timestamp = dt.now().strftime("%Y%m%d%H%M%S")
-    return f"{prefix}-{slug}-{timestamp}"
+    """Generate a short unique display ID from a UUID, using the first 8 characters."""
+    return str(uuid.uuid4()).replace("-", "")[:8]
 
 
 @auth_router.post("/shop/register", response_model=ShopRegisterResponse)
@@ -106,22 +104,20 @@ def shop_register(
     if existing_email:
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    # Save uploaded logo to local static folder and store a web path for API consumers.
-    import os
-    from pathlib import Path
-    import shutil
-
-    uploads_dir = Path("static") / "uploads"
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    # Use timestamp + uuid to avoid collisions and keep original extension
+    now = datetime.now()
     orig_name = getattr(shop_logo, "filename", "upload")
-    ext = Path(orig_name).suffix or ""
-    filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}{ext}"
-    safe_path = uploads_dir / filename
+    shop_display_id = _generate_display_id(shop_name)
     try:
-        with safe_path.open("wb") as out_file:
-            shutil.copyfileobj(shop_logo.file, out_file)
-        logo_path = f"/static/uploads/{filename}"
+        if hasattr(shop_logo.file, "seek"):
+            shop_logo.file.seek(0)
+        logo_url = upload_image_to_shop_container(
+            shop_logo.file,
+            shop_display_id,
+            orig_name,
+            shop_name=shop_name,
+            city=city,
+            created_at=now,
+        )
     except Exception as ex:
         raise HTTPException(status_code=400, detail=f"Failed to save uploaded logo: {ex}")
     finally:
@@ -129,8 +125,6 @@ def shop_register(
             shop_logo.file.close()
         except Exception:
             pass
-
-    now = datetime.now()
 
     # Create user first so shop can reference owner_id.
     new_user = user(
@@ -158,8 +152,8 @@ def shop_register(
         youtube_url=youtube_url.strip() if youtube_url else None,
         instagram_url=instagram_url.strip() if instagram_url else None,
         facebook_url=facebook_url.strip() if facebook_url else None,
-        shop_logo_url=logo_path,
-        display_id=str(uuid.uuid4().hex)[:8],
+        shop_logo_url=logo_url,
+        display_id=shop_display_id,
         created_at=now,
         updated_at=now,
         is_active=True,

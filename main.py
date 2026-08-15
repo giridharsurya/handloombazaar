@@ -5,7 +5,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import uvicorn
 import os
+from dotenv import load_dotenv
 from sqlalchemy import text
+
+load_dotenv()
 
 from db.database import db
 from api.products import products_router

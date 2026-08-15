@@ -5,12 +5,13 @@ import uuid
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile, File, Response, Query
-from sqlalchemy import func
+from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr, Field
 from db.database import get_session
 from db.db_models import shop, UserRole, product
 from api.analytics import get_entity_view_counts, track_entity_view
+from utils.blob_storage import upload_image_to_shop_container
 
 shops_router = APIRouter(prefix="/api/shops", tags=["shops"])
 
@@ -205,17 +206,18 @@ def update_shop_logo(
 ):
     selected_shop = _get_manageable_shop(display_id, request, session)
 
-    uploads_dir = Path("static") / "uploads" / "shops"
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-
     original_name = getattr(shop_logo, "filename", "upload")
-    extension = Path(original_name).suffix or ""
-    filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}{extension}"
-    target = uploads_dir / filename
-
     try:
-        with target.open("wb") as out_file:
-            shutil.copyfileobj(shop_logo.file, out_file)
+        if hasattr(shop_logo.file, "seek"):
+            shop_logo.file.seek(0)
+        logo_url = upload_image_to_shop_container(
+            shop_logo.file,
+            selected_shop.display_id,
+            original_name,
+            shop_name=selected_shop.name,
+            city=selected_shop.city,
+            created_at=selected_shop.created_at,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to save uploaded logo: {exc}")
     finally:
@@ -224,7 +226,7 @@ def update_shop_logo(
         except Exception:
             pass
 
-    selected_shop.shop_logo_url = f"/static/uploads/shops/{filename}"
+    selected_shop.shop_logo_url = logo_url
     selected_shop.updated_at = datetime.now()
     session.commit()
     session.refresh(selected_shop)
@@ -239,7 +241,21 @@ def list_shops(
     view_count: bool = Query(False),
     session: Session = Depends(get_session),
 ):
-    rows = session.query(shop).filter(shop.approved.is_(True), shop.is_active.is_(True)).all()
+    active_product_exists = exists(
+        select(product.id).where(
+            product.shop_id == shop.id,
+            product.is_active.is_(True),
+        )
+    )
+    rows = (
+        session.query(shop)
+        .filter(
+            shop.approved.is_(True),
+            shop.is_active.is_(True),
+            active_product_exists,
+        )
+        .all()
+    )
     total_count = len(rows)
     shop_ids = [r.id for r in rows]
 

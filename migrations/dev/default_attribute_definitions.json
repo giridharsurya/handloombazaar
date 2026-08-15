@@ -1,0 +1,164 @@
+[
+  {
+    "attribute_name": "FABRIC",
+    "is_filterable": true,
+    "is_required": false,
+    "options": [
+      "Cotton",
+      "Kota",
+      "Silk Cotton",
+      "Georgette",
+      "Mulmul",
+      "Tussar",
+      "Linen",
+      "Chiffon",
+      "Organza",
+      "Khadi",
+      "Cotton and Combination",
+      "Silk"
+    ]
+  },
+  {
+    "attribute_name": "COLOUR",
+    "is_filterable": true,
+    "is_required": false,
+    "options": [
+      "Grey",
+      "Light Blue",
+      "Light Green",
+      "Light Orange",
+      "Light Pink",
+      "Light Red",
+      "Light Violet",
+      "Light Yellow",
+      "Maroon",
+      "Multicolored",
+      "Off White",
+      "Orange",
+      "Pink",
+      "Purple",
+      "Red",
+      "Violet",
+      "White",
+      "Yellow",
+      "DarkGreen",
+      "Peach"
+    ]
+  },
+  {
+    "attribute_name": "OCCASION",
+    "is_filterable": true,
+    "is_required": false,
+    "options": [
+      "Festive Wear",
+      "Casual Wear",
+      "Formal Wear",
+      "Daily Wear",
+      "Party Wear",
+      "Pujo",
+      "Teej",
+      "Traditional Wear",
+      "Wedding Wear"
+    ]
+  },
+  {
+    "attribute_name": "ORIGIN",
+    "is_filterable": true,
+    "is_required": false,
+    "options": [
+      "Bengal",
+      "Contemporary",
+      "Rajasthan",
+      "Chattisgarh",
+      "Bagru",
+      "South",
+      "Gujarat",
+      "Bagh",
+      "Banaras",
+      "Karnataka",
+      "Pochampalli",
+      "Maharashtra",
+      "Assam",
+      "Bhagalpur",
+      "Odisha",
+      "Banarasi",
+      "Chanderi",
+      "Ikat",
+      "Lucknow",
+      "Madhya Pradesh",
+      "Maheshwar",
+      "Murshidabad",
+      "Ujjain"
+    ]
+  },
+  {
+    "attribute_name": "Type & Pattern",
+    "is_filterable": true,
+    "is_required": false,
+    "options": [
+      "Ajrakh",
+      "Applique",
+      "Bagru",
+      "Bandhani",
+      "Batik",
+      "Block Printed",
+      "Chikankari",
+      "Cutwork",
+      "Dabu",
+      "Embroidered",
+      "Embroidery",
+      "Extra Weft",
+      "Gota Patti",
+      "Hand Painted",
+      "Ikat",
+      "Jamdani",
+      "Kantha",
+      "Lambani",
+      "Lehariya",
+      "Mukaish",
+      "Printed",
+      "Prints",
+      "Sanganeri",
+      "Sequin",
+      "Tie and Dye",
+      "Woven",
+      "Woven Design"
+    ]
+  },
+  {
+    "attribute_name": "ZARI",
+    "is_filterable": true,
+    "is_required": false,
+    "options": [
+      "Without Zari",
+      "Tested Zari",
+      "Gold Tested Zari",
+      "Faux Zari",
+      "Gold Faux Zari",
+      "Silver Faux Zari"
+    ]
+  },
+  {
+    "attribute_name": "Loom",
+    "is_filterable": true,
+    "is_required": false,
+    "options": [
+      "Powerloom",
+      "NA",
+      "Made On Powerloom",
+      "Made on Powerloom",
+      "Handwoven Saree",
+      "Hand Woven",
+      "Handloom"
+    ]
+  },
+  {
+    "attribute_name": "Blouse Piece",
+    "is_filterable": true,
+    "is_required": false,
+    "options": [
+      "With Blouse Piece",
+      "Without Blouse Piece"
+    ]
+  }
+]
