@@ -2,7 +2,7 @@
   {
     "attribute_name": "FABRIC",
     "is_filterable": true,
-    "is_required": false,
+    "is_required": true,
     "options": [
       "Cotton",
       "Kota",
@@ -21,34 +21,13 @@
   {
     "attribute_name": "COLOUR",
     "is_filterable": true,
-    "is_required": false,
-    "options": [
-      "Grey",
-      "Light Blue",
-      "Light Green",
-      "Light Orange",
-      "Light Pink",
-      "Light Red",
-      "Light Violet",
-      "Light Yellow",
-      "Maroon",
-      "Multicolored",
-      "Off White",
-      "Orange",
-      "Pink",
-      "Purple",
-      "Red",
-      "Violet",
-      "White",
-      "Yellow",
-      "DarkGreen",
-      "Peach"
-    ]
+    "is_required": true,
+    "options": [ "Black #000", "Blue #00f", "Beige #f5f5dc", "Brown #964b00","Cream #FFFDD0", "Dark Blue #00008b", "Dark Brown #5C4033", "Dark Green #023020", "Dark Orange #8b4000", "Dark Pink #aa336a", "Dark Red #8b0000", "Dark Violet #9400d3", "Dark Yellow #8b8000", "Gold #ffd700", "Green #00ff00", "Grey #808080", "Lavender #E6E6FA", "Light Blue #add8e6", "Light Green #90ee90", "Light Orange #ffd580", "Light Pink #ffb6c1", "Light Red #ffcccb", "Light Violet #cf9fff", "Light Yellow #ffffe0", "Maroon #800000", "Multi #ff00e1", "Multicolored", "Navy #000080", "Off White #f5f5f5", "Orange #ffa500", "Pink #ffc0cb", "Purple #a020f0", "Red #ff0000", "Silver #C0C0C0", "Violet #8f00ff", "White #ffffff", "Yellow #ffff00"]
   },
   {
     "attribute_name": "OCCASION",
     "is_filterable": true,
-    "is_required": false,
+    "is_required": true,
     "options": [
       "Festive Wear",
       "Casual Wear",
@@ -63,7 +42,7 @@
   },
   {
     "attribute_name": "ORIGIN",
-    "is_filterable": true,
+    "is_filterable": false,
     "is_required": false,
     "options": [
       "Bengal",
@@ -94,7 +73,7 @@
   {
     "attribute_name": "Type & Pattern",
     "is_filterable": true,
-    "is_required": false,
+    "is_required": true,
     "options": [
       "Ajrakh",
       "Applique",
@@ -128,7 +107,7 @@
   {
     "attribute_name": "ZARI",
     "is_filterable": true,
-    "is_required": false,
+    "is_required": true,
     "options": [
       "Without Zari",
       "Tested Zari",
@@ -141,21 +120,17 @@
   {
     "attribute_name": "Loom",
     "is_filterable": true,
-    "is_required": false,
+    "is_required": true,
     "options": [
-      "Powerloom",
-      "NA",
-      "Made On Powerloom",
-      "Made on Powerloom",
-      "Handwoven Saree",
+      "Handloom",
       "Hand Woven",
-      "Handloom"
+      "Powerloom"
     ]
   },
   {
     "attribute_name": "Blouse Piece",
     "is_filterable": true,
-    "is_required": false,
+    "is_required": true,
     "options": [
       "With Blouse Piece",
       "Without Blouse Piece"
