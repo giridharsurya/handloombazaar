@@ -10,4 +10,5 @@ bcrypt
 email-validator
 azure-identity
 azure-storage-blob
+azure-communication-email
 pytest
