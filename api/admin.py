@@ -70,6 +70,10 @@ class AttributeUpdateRequest(BaseModel):
     is_required: Optional[bool] = None
 
 
+class AttributeOptionCreateRequest(BaseModel):
+    option_value: str = Field(min_length=1, max_length=255)
+
+
 class AttributeOptionUpdateRequest(BaseModel):
     option_value: Optional[str] = Field(default=None, min_length=1, max_length=255)
 
@@ -449,6 +453,51 @@ def get_attributes(session: Session = Depends(get_session)):
             }
         )
     return {"items": result}
+
+
+@admin_router.post("/attributes/{attribute_id}/options")
+def create_attribute_option(
+    attribute_id: int,
+    payload: AttributeOptionCreateRequest,
+    session: Session = Depends(get_session),
+):
+    selected_attribute = (
+        session.query(attribute_definition).filter(attribute_definition.id == attribute_id).first()
+    )
+    if selected_attribute is None:
+        raise HTTPException(status_code=404, detail="Attribute not found")
+
+    normalized_option = payload.option_value.strip()
+    if not normalized_option:
+        raise HTTPException(status_code=400, detail="Option value is required")
+
+    existing_options = (
+        session.query(attribute_option)
+        .filter(attribute_option.attribute_definition_id == attribute_id)
+        .all()
+    )
+    for option in existing_options:
+        if option.option_value.strip().lower() == normalized_option.lower():
+            raise HTTPException(status_code=400, detail="Option already exists for this attribute")
+
+    option_row = attribute_option(
+        attribute_definition_id=attribute_id,
+        option_value=normalized_option,
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+    )
+    session.add(option_row)
+    session.commit()
+    session.refresh(option_row)
+
+    return {
+        "message": "Option created successfully",
+        "option": {
+            "id": option_row.id,
+            "value": option_row.option_value,
+            "display_id": option_row.display_id,
+        },
+    }
 
 
 @admin_router.put("/attributes/{attribute_id}")
