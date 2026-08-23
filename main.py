@@ -16,7 +16,6 @@ load_dotenv()
 from db.database import db
 from scripts.run_migrations import run_migrations
 from api.products import products_router
-from api.create import create_router
 from api.admin import admin_router
 from api.auth import auth_router
 from api.shops import shops_router
@@ -116,7 +115,7 @@ async def auth_middleware(request: Request, call_next):
 
 
 app.include_router(products_router)
-app.include_router(create_router)
+# app.include_router(create_router)
 app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(shops_router)
