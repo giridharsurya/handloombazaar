@@ -66,6 +66,8 @@ class shop(Base):
     display_id: Mapped[str] = mapped_column(String(8), unique=True, nullable=False, default=lambda: str(uuid.uuid4().hex)[:8])
     owner_id: Mapped[int] = mapped_column(Integer,ForeignKey("users.id", ondelete="RESTRICT"),unique=True,nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    shop_slug: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    description: Mapped[str] = mapped_column(String(1000), nullable=True)
     year_established: Mapped[int] = mapped_column(Integer, nullable=False)
     address: Mapped[str] = mapped_column(String(500), nullable=False)
     city: Mapped[str] = mapped_column(String(120), nullable=True)

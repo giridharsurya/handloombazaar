@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from db.database import get_session
 from db.db_models import shop, user, UserRole
+from api.shops import _validate_shop_slug_candidate
 from utils.auth import hash_password, verify_password, create_user_token, verify_token
 from utils.blob_storage import upload_image_to_shop_container
 
@@ -196,6 +197,8 @@ class ShopRegisterRequest(BaseModel):
     email: EmailStr
     username: str = Field(..., min_length=3, max_length=255)
     password: str = Field(..., min_length=6)
+    shop_slug: str | None = Field(default=None, min_length=3, max_length=100)
+    description: str | None = Field(default=None, max_length=1000)
     year_established: int = Field(..., ge=1800, le=2100)
     address: str = Field(..., min_length=3, max_length=500)
     city: str = Field(..., min_length=2, max_length=120)
@@ -260,6 +263,8 @@ def shop_register(
     email: EmailStr = Form(...),
     username: str = Form(...),
     password: str = Form(...),
+    shop_slug: str | None = Form(default=None),
+    description: str | None = Form(default=None),
     year_established: int = Form(...),
     address: str = Form(...),
     city: str = Form(...),
@@ -305,6 +310,11 @@ def shop_register(
         except Exception:
             pass
 
+    try:
+        normalized_slug = _validate_shop_slug_candidate(shop_slug, session=session)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # Create user first so shop can reference owner_id.
     new_user = user(
         username=username,
@@ -322,6 +332,8 @@ def shop_register(
     new_shop = shop(
         owner_id=new_user.id,
         name=shop_name,
+        shop_slug=normalized_slug,
+        description=description.strip() if description else None,
         email=email,
         year_established=year_established,
         address=address,

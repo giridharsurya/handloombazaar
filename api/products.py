@@ -533,6 +533,20 @@ def _apply_sort(base_query, sort_by: Literal["newest", "price-low", "price-high"
     return base_query.order_by(product.created_at.desc(), product.id.desc())
 
 
+def _is_public_shop_visible_for_user(shop_row: shop | None, current_user: Optional[UserModel]) -> bool:
+    if shop_row is None:
+        return False
+    if current_user is None or current_user.role == UserRole.USER:
+        return bool(shop_row.is_active and shop_row.approved)
+    if current_user.role == UserRole.SHOP_OWNER:
+        if shop_row.owner_id == getattr(current_user, "id", None):
+            return True
+        return bool(shop_row.is_active and shop_row.approved)
+    if current_user.role == UserRole.ADMIN:
+        return True
+    return False
+
+
 @products_router.get("", response_model=ProductsResponse)
 def get_products(
     request: Request,
@@ -582,14 +596,27 @@ def get_products(
             if track_shop_view:
                 track_entity_view(session, request, response, "shop", shop_row.id)
     elif current_user.role == UserRole.SHOP_OWNER:
-        # single-shop vendor: find the shop owned by this user
-        shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
-        if not shop_row:
+        # shop owners can browse public product pages for other shops, but still keep
+        # their own shop data available for private dashboard use.
+        owning_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if shop_display_id is not None:
+            target_shop = session.query(shop).filter(shop.display_id == shop_display_id).first()
+            if not target_shop:
+                return ProductsResponse(success=True, message="Products retrieved successfully", data=ProductsResponseData(page=page, page_size=page_size, total_count=0, has_next=False, items=[]))
+            if owning_shop is None and not _is_public_shop_visible_for_user(target_shop, current_user):
+                return ProductsResponse(success=True, message="Products retrieved successfully", data=ProductsResponseData(page=page, page_size=page_size, total_count=0, has_next=False, items=[]))
+            if owning_shop is not None and target_shop.id == owning_shop.id:
+                base_query = session.query(product).filter(product.shop_id == target_shop.id)
+            else:
+                base_query = session.query(product).filter(
+                    product.shop_id == target_shop.id,
+                    product.is_active.is_(True),
+                    product.stock_quantity > 0,
+                )
+        elif owning_shop is not None:
+            base_query = session.query(product).filter(product.shop_id == owning_shop.id)
+        else:
             return {"page": page, "page_size": page_size, "total_count": 0, "has_next": False, "items": []}
-        vendor_shop_display_id = shop_row.display_id
-        if shop_display_id is not None and shop_display_id != vendor_shop_display_id:
-            raise HTTPException(status_code=403, detail="Not authorized for requested shop")
-        base_query = session.query(product).filter(product.shop_id == shop_row.id)
     elif current_user.role == UserRole.ADMIN:
         # admin: full access
         base_query = session.query(product)
@@ -767,11 +794,11 @@ def get_product_details(
     if current_user is None or current_user.role == UserRole.USER:
         q = q.filter(product.is_active.is_(True))
     elif current_user.role == UserRole.SHOP_OWNER:
-        # vendor can view product only if it belongs to their shop
-        shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
-        if not shop_row:
-            raise HTTPException(status_code=404, detail="Product not found")
-        q = q.filter(product.shop_id == shop_row.id)
+        owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if owner_shop is not None:
+            q = q.filter(or_(product.shop_id == owner_shop.id, and_(product.is_active.is_(True), product.stock_quantity > 0)))
+        else:
+            q = q.filter(product.is_active.is_(True), product.stock_quantity > 0)
     elif current_user.role == UserRole.ADMIN:
         # admin: no additional filters
         q = q
@@ -781,6 +808,10 @@ def get_product_details(
     selected_product = q.first()
 
     if selected_product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    shop_row = session.query(shop).filter(shop.id == selected_product.shop_id).first()
+    if not _is_public_shop_visible_for_user(shop_row, current_user):
         raise HTTPException(status_code=404, detail="Product not found")
 
     attribute_rows = (
@@ -832,10 +863,11 @@ def get_product_variants(
     if current_user is None or current_user.role == UserRole.USER:
         q = q.filter(product.is_active.is_(True))
     elif current_user.role == UserRole.SHOP_OWNER:
-        shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
-        if not shop_row:
-            raise HTTPException(status_code=404, detail="Product not found")
-        q = q.filter(product.shop_id == shop_row.id)
+        owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if owner_shop is not None:
+            q = q.filter(or_(product.shop_id == owner_shop.id, and_(product.is_active.is_(True), product.stock_quantity > 0)))
+        else:
+            q = q.filter(product.is_active.is_(True), product.stock_quantity > 0)
     elif current_user.role == UserRole.ADMIN:
         q = q
     else:
@@ -883,10 +915,11 @@ def get_similar_products_from_shop(
     if current_user is None or current_user.role == UserRole.USER:
         q = q.filter(product.is_active.is_(True), product.stock_quantity > 0)
     elif current_user.role == UserRole.SHOP_OWNER:
-        shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
-        if not shop_row:
-            raise HTTPException(status_code=404, detail="Product not found")
-        q = q.filter(product.shop_id == shop_row.id)
+        owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if owner_shop is not None:
+            q = q.filter(or_(product.shop_id == owner_shop.id, and_(product.is_active.is_(True), product.stock_quantity > 0)))
+        else:
+            q = q.filter(product.is_active.is_(True), product.stock_quantity > 0)
     elif current_user.role == UserRole.ADMIN:
         pass
     else:
@@ -934,10 +967,11 @@ def get_similar_products_from_other_shops(
     if current_user is None or current_user.role == UserRole.USER:
         q = q.filter(product.is_active.is_(True), product.stock_quantity > 0)
     elif current_user.role == UserRole.SHOP_OWNER:
-        shop_row = session.query(shop).filter(shop.owner_id == current_user.id).first()
-        if not shop_row:
-            raise HTTPException(status_code=404, detail="Product not found")
-        q = q.filter(product.shop_id == shop_row.id)
+        owner_shop = session.query(shop).filter(shop.owner_id == current_user.id).first()
+        if owner_shop is not None:
+            q = q.filter(or_(product.shop_id == owner_shop.id, and_(product.is_active.is_(True), product.stock_quantity > 0)))
+        else:
+            q = q.filter(product.is_active.is_(True), product.stock_quantity > 0)
     elif current_user.role == UserRole.ADMIN:
         pass
     else:

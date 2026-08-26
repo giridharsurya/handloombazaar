@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+import re
 import shutil
 import uuid
 from typing import Literal
@@ -26,6 +27,7 @@ class ShopStatusResponse(BaseModel):
 
 
 class ShopDetailResponse(ShopStatusResponse):
+    shop_slug: str
     description: str | None
     email: str
     address: str
@@ -38,9 +40,37 @@ class ShopDetailResponse(ShopStatusResponse):
     facebook_url: str | None
 
 
+def _normalize_shop_slug(value: str | None) -> str:
+    if value is None:
+        return ""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value).strip().lower())
+    slug = slug.strip("-")
+    return slug[:100]
+
+
+def _validate_shop_slug_candidate(candidate: str | None, *, session: Session, display_id: str | None = None) -> str:
+    raw_value = (candidate or "").strip()
+    if raw_value == "":
+        raise ValueError("Shop URL slug is required")
+
+    normalized = raw_value.lower()
+    if len(normalized) < 3:
+        raise ValueError("Shop URL slug must be at least 3 characters")
+    if not re.fullmatch(r"[a-z0-9-]+", normalized) or normalized.startswith("-") or normalized.endswith("-"):
+        raise ValueError("Shop URL slug may contain only lowercase letters, numbers, and hyphens")
+
+    existing_shop = session.query(shop).filter(shop.shop_slug == normalized).first()
+    if existing_shop is not None and (display_id is None or existing_shop.display_id != display_id):
+        raise ValueError("This shop URL is already taken. Please choose another slug.")
+
+    return normalized
+
+
 class ShopUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     email: EmailStr | None = None
+    shop_slug: str | None = Field(default=None, min_length=3, max_length=100)
+    description: str | None = Field(default=None, max_length=1000)
     year_established: int | None = Field(default=None, ge=1800, le=2100)
     address: str | None = Field(default=None, min_length=3, max_length=500)
     city: str | None = Field(default=None, min_length=2, max_length=120)
@@ -52,12 +82,15 @@ class ShopUpdateRequest(BaseModel):
 
 
 def _build_shop_detail_response(selected_shop: shop) -> ShopDetailResponse:
+    stored_slug = (getattr(selected_shop, "shop_slug", None) or "").strip()
+    valid_slug = _normalize_shop_slug(stored_slug) if stored_slug and stored_slug.lower() not in {"none", "null"} else ""
     return ShopDetailResponse(
         display_id=selected_shop.display_id,
         name=selected_shop.name,
         shop_logo_url=selected_shop.shop_logo_url,
         approved=bool(selected_shop.approved),
         is_active=bool(selected_shop.is_active),
+        shop_slug=valid_slug,
         description=getattr(selected_shop, "description", None),
         email=selected_shop.email,
         address=selected_shop.address,
@@ -100,6 +133,31 @@ def _get_manageable_shop(display_id: str, request: Request, session: Session) ->
     return selected_shop
 
 
+def _resolve_public_shop(session: Session, identifier: str):
+    normalized_identifier = (identifier or "").strip()
+    if not normalized_identifier:
+        return None
+
+    return (
+        session.query(shop)
+        .filter(
+            shop.approved.is_(True),
+            shop.is_active.is_(True),
+            (
+                (shop.display_id == normalized_identifier)
+                | (
+                    shop.shop_slug.is_not(None)
+                    & (shop.shop_slug != "")
+                    & (shop.shop_slug != "None")
+                    & (shop.shop_slug != "null")
+                    & (shop.shop_slug == normalized_identifier)
+                )
+            ),
+        )
+        .first()
+    )
+
+
 @shops_router.get("/{display_id}/status", response_model=ShopStatusResponse)
 def shop_status(display_id: str, session: Session = Depends(get_session)):
     selected_shop = session.query(shop).filter(shop.display_id == display_id).first()
@@ -115,17 +173,23 @@ def shop_status(display_id: str, session: Session = Depends(get_session)):
     )
 
 
+@shops_router.get("/validate-slug")
+def validate_shop_slug(
+    slug: str = Query(..., min_length=1, max_length=100),
+    display_id: str | None = Query(default=None),
+    session: Session = Depends(get_session),
+):
+    try:
+        normalized = _validate_shop_slug_candidate(slug, session=session, display_id=display_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"valid": True, "slug": normalized, "message": "Shop URL slug is available."}
+
+
 @shops_router.get("/{display_id}", response_model=ShopDetailResponse)
 def shop_detail(display_id: str, request: Request, response: Response, session: Session = Depends(get_session)):
-    selected_shop = (
-        session.query(shop)
-        .filter(
-            shop.display_id == display_id,
-            shop.approved.is_(True),
-            shop.is_active.is_(True),
-        )
-        .first()
-    )
+    selected_shop = _resolve_public_shop(session, display_id)
     if selected_shop is None:
         raise HTTPException(status_code=404, detail="Shop not found")
 
@@ -166,6 +230,13 @@ def update_shop_details(
         if payload.name is None:
             raise HTTPException(status_code=400, detail="Shop name cannot be null")
         selected_shop.name = payload.name.strip()
+    if "shop_slug" in provided_fields:
+        if payload.shop_slug is None or (payload.shop_slug or "").strip() == "":
+            raise HTTPException(status_code=400, detail="Shop URL slug is required")
+        normalized_slug = _validate_shop_slug_candidate(payload.shop_slug, session=session, display_id=selected_shop.display_id)
+        selected_shop.shop_slug = normalized_slug
+    if "description" in provided_fields:
+        selected_shop.description = payload.description.strip() if payload.description else None
     if "year_established" in provided_fields:
         if payload.year_established is None:
             raise HTTPException(status_code=400, detail="Year established cannot be null")
@@ -252,6 +323,10 @@ def list_shops(
         .filter(
             shop.approved.is_(True),
             shop.is_active.is_(True),
+            shop.shop_slug.is_not(None),
+            shop.shop_slug != "",
+            shop.shop_slug != "None",
+            shop.shop_slug != "null",
             active_product_exists,
         )
         .all()
@@ -280,6 +355,7 @@ def list_shops(
         "items": [
             {
                 "display_id": row.display_id,
+                "shop_slug": _normalize_shop_slug(row.shop_slug) if (row.shop_slug or "").strip() and (row.shop_slug or "").strip().lower() not in {"none", "null"} else "",
                 "name": row.name,
                 "shop_logo_url": row.shop_logo_url,
                 "approved": bool(row.approved),

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import uuid
 
 import pytest
+from fastapi.testclient import TestClient
 
 from api.admin import deactivate_shop, reactivate_shop
 from api.collections import list_collections
@@ -11,8 +12,9 @@ from api.products import (
     _ensure_required_attributes_selected,
     get_product_variants,
 )
-from api.shops import list_shops
+from api.shops import _resolve_public_shop, _validate_shop_slug_candidate, list_shops
 from db.database import get_session
+from main import app
 from db.db_models import (
     collection,
     collection_product,
@@ -107,6 +109,178 @@ def test_ensure_required_attributes_selected_rejects_missing_required_definition
     session.close()
 
 
+def test_validate_slug_route_is_not_matched_as_shop_display_id_route():
+    client = TestClient(app)
+
+    response = client.get("/api/shops/validate-slug?slug=az-shop")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["valid"] is True
+    assert payload["slug"] == "az-shop"
+
+
+def test_resolve_public_shop_accepts_slug_or_display_id():
+    session = next(get_session())
+    now = datetime.now()
+    unique = uuid.uuid4().hex[:8]
+
+    owner = user(
+        username=f"public_slug_owner_{unique}",
+        email=f"public_slug_owner_{unique}@example.com",
+        password_hash="hash",
+        role=UserRole.SHOP_OWNER,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    session.add(owner)
+    session.flush()
+
+    public_shop = shop(
+        owner_id=owner.id,
+        display_id=uuid.uuid4().hex[:8],
+        name=f"Slug Shop {unique}",
+        shop_slug=f"slug-shop-{unique}",
+        year_established=2020,
+        address="Main Street",
+        city="Test City",
+        phone_number="1234567890",
+        email=f"slug_shop_{unique}@example.com",
+        website_url=None,
+        shop_logo_url="/images/logo.jpg",
+        youtube_url=None,
+        instagram_url=None,
+        facebook_url=None,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+        approved=True,
+    )
+    session.add(public_shop)
+    session.commit()
+
+    by_slug = _resolve_public_shop(session, public_shop.shop_slug)
+    by_display_id = _resolve_public_shop(session, public_shop.display_id)
+
+    assert by_slug is not None
+    assert by_slug.id == public_shop.id
+    assert by_display_id is not None
+    assert by_display_id.id == public_shop.id
+
+
+def test_validate_shop_slug_candidate_rejects_invalid_characters_and_duplicates():
+    session = next(get_session())
+    now = datetime.now()
+    unique = uuid.uuid4().hex[:8]
+
+    owner = user(
+        username=f"slug_validate_owner_{unique}",
+        email=f"slug_validate_owner_{unique}@example.com",
+        password_hash="hash",
+        role=UserRole.SHOP_OWNER,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    session.add(owner)
+    session.flush()
+
+    existing_shop = shop(
+        owner_id=owner.id,
+        display_id=uuid.uuid4().hex[:8],
+        name=f"Existing Shop {unique}",
+        shop_slug=f"existing-shop-{unique}",
+        year_established=2020,
+        address="Main Street",
+        city="Test City",
+        phone_number="1234567890",
+        email=f"existing_shop_{unique}@example.com",
+        website_url=None,
+        shop_logo_url="/images/logo.jpg",
+        youtube_url=None,
+        instagram_url=None,
+        facebook_url=None,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+        approved=True,
+    )
+    session.add(existing_shop)
+    session.commit()
+
+    with pytest.raises(ValueError, match="required"):
+        _validate_shop_slug_candidate("", session=session)
+
+    with pytest.raises(ValueError, match="only lowercase letters, numbers, and hyphens"):
+        _validate_shop_slug_candidate("invalid_shop", session=session)
+
+    with pytest.raises(ValueError, match="already taken"):
+        _validate_shop_slug_candidate(f"existing-shop-{unique}", session=session)
+
+    assert _validate_shop_slug_candidate(f"new-shop-{unique}", session=session) == f"new-shop-{unique}"
+    session.close()
+
+
+def test_list_shops_excludes_shops_without_persisted_slug():
+    session = next(get_session())
+    now = datetime.now()
+    unique = uuid.uuid4().hex[:8]
+
+    owner = user(
+        username=f"legacy_slug_owner_{unique}",
+        email=f"legacy_slug_owner_{unique}@example.com",
+        password_hash="hash",
+        role=UserRole.SHOP_OWNER,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    session.add(owner)
+    session.flush()
+
+    legacy_shop = shop(
+        owner_id=owner.id,
+        display_id=uuid.uuid4().hex[:8],
+        name=f"Legacy Shop {unique}",
+        shop_slug=None,
+        year_established=2020,
+        address="Main Street",
+        city="Test City",
+        phone_number="1234567890",
+        email=f"legacy_shop_{unique}@example.com",
+        website_url=None,
+        shop_logo_url="/images/logo.jpg",
+        youtube_url=None,
+        instagram_url=None,
+        facebook_url=None,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+        approved=True,
+    )
+    session.add(legacy_shop)
+    session.flush()
+
+    product_row = product(
+        display_id=uuid.uuid4().hex[:8],
+        shop_id=legacy_shop.id,
+        name=f"Legacy Product {unique}",
+        price=180,
+        stock_quantity=9,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    session.add(product_row)
+    session.commit()
+
+    response = list_shops(page=1, page_size=20, sort_by="newest", session=session)
+    items = response["items"]
+    assert not any(item["display_id"] == legacy_shop.display_id for item in items)
+    session.close()
+
+
 def test_list_shops_only_returns_shops_with_active_products():
     session = next(get_session())
     now = datetime.now()
@@ -137,6 +311,7 @@ def test_list_shops_only_returns_shops_with_active_products():
         owner_id=owner_one.id,
         display_id=uuid.uuid4().hex[:8],
         name=f"Visible Shop {unique}",
+        shop_slug=f"visible-shop-{unique}",
         year_established=2020,
         address="Main Street",
         city="Test City",
@@ -156,6 +331,7 @@ def test_list_shops_only_returns_shops_with_active_products():
         owner_id=owner_two.id,
         display_id=uuid.uuid4().hex[:8],
         name=f"Hidden Shop {unique}",
+        shop_slug=f"hidden-shop-{unique}",
         year_established=2021,
         address="Second Street",
         city="Test City",
@@ -205,6 +381,199 @@ def test_list_shops_only_returns_shops_with_active_products():
     names = [item["name"] for item in response["items"]]
     assert shop_with_product.name in names
     assert shop_without_product.name not in names
+    session.close()
+
+
+def test_shop_owner_can_view_other_shop_public_product_list():
+    session = next(get_session())
+    now = datetime.now()
+    unique = uuid.uuid4().hex[:8]
+
+    owner_a = user(
+        username=f"vendor_a_{unique}",
+        email=f"vendor_a_{unique}@example.com",
+        password_hash="hash",
+        role=UserRole.SHOP_OWNER,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    owner_b = user(
+        username=f"vendor_b_{unique}",
+        email=f"vendor_b_{unique}@example.com",
+        password_hash="hash",
+        role=UserRole.SHOP_OWNER,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    session.add_all([owner_a, owner_b])
+    session.flush()
+
+    my_shop = shop(
+        owner_id=owner_a.id,
+        display_id=uuid.uuid4().hex[:8],
+        name=f"My Shop {unique}",
+        year_established=2020,
+        address="Main Street",
+        city="Test City",
+        phone_number="1234567890",
+        email=f"my_shop_{unique}@example.com",
+        website_url=None,
+        shop_logo_url="/images/logo.jpg",
+        youtube_url=None,
+        instagram_url=None,
+        facebook_url=None,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+        approved=True,
+    )
+    public_shop = shop(
+        owner_id=owner_b.id,
+        display_id=uuid.uuid4().hex[:8],
+        name=f"Public Shop {unique}",
+        year_established=2021,
+        address="Public Street",
+        city="Test City",
+        phone_number="1234567891",
+        email=f"public_shop_{unique}@example.com",
+        website_url=None,
+        shop_logo_url="/images/logo.jpg",
+        youtube_url=None,
+        instagram_url=None,
+        facebook_url=None,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+        approved=True,
+    )
+    session.add_all([my_shop, public_shop])
+    session.flush()
+
+    product_row = product(
+        display_id=uuid.uuid4().hex[:8],
+        shop_id=public_shop.id,
+        name=f"Public Product {unique}",
+        price=250,
+        stock_quantity=12,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    session.add(product_row)
+    session.commit()
+
+    fake_request = SimpleNamespace(state=SimpleNamespace(current_user=owner_a))
+    response = __import__("starlette.responses", fromlist=["Response"]).Response()
+
+    items_response = __import__("api.products", fromlist=["get_products"]).get_products(
+        request=fake_request,
+        response=response,
+        page=1,
+        page_size=20,
+        search=None,
+        shop_display_id=public_shop.display_id,
+        track_shop_view=False,
+        min_price=None,
+        max_price=None,
+        sort_by="newest",
+        view_count=False,
+        attribute_option_ids=[],
+        attribute_filters=[],
+        product_group_id=None,
+        session=session,
+    )
+
+    assert items_response.success is True
+    assert len(items_response.data.items) == 1
+    assert items_response.data.items[0].shop_display_id == public_shop.display_id
+    session.close()
+
+
+def test_inactive_shop_products_are_hidden_from_public_listing():
+    session = next(get_session())
+    now = datetime.now()
+    unique = uuid.uuid4().hex[:8]
+
+    owner = user(
+        username=f"inactive_owner_{unique}",
+        email=f"inactive_owner_{unique}@example.com",
+        password_hash="hash",
+        role=UserRole.SHOP_OWNER,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    other_owner = user(
+        username=f"other_owner_{unique}",
+        email=f"other_owner_{unique}@example.com",
+        password_hash="hash",
+        role=UserRole.SHOP_OWNER,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    session.add_all([owner, other_owner])
+    session.flush()
+
+    hidden_shop = shop(
+        owner_id=owner.id,
+        display_id=uuid.uuid4().hex[:8],
+        name=f"Hidden Shop {unique}",
+        year_established=2020,
+        address="Hidden Street",
+        city="Test City",
+        phone_number="1234567890",
+        email=f"hidden_shop_{unique}@example.com",
+        website_url=None,
+        shop_logo_url="/images/logo.jpg",
+        youtube_url=None,
+        instagram_url=None,
+        facebook_url=None,
+        created_at=now,
+        updated_at=now,
+        is_active=False,
+        approved=True,
+    )
+    session.add(hidden_shop)
+    session.flush()
+
+    product_row = product(
+        display_id=uuid.uuid4().hex[:8],
+        shop_id=hidden_shop.id,
+        name=f"Hidden Shop Product {unique}",
+        price=250,
+        stock_quantity=12,
+        created_at=now,
+        updated_at=now,
+        is_active=True,
+    )
+    session.add(product_row)
+    session.commit()
+
+    response = __import__("starlette.responses", fromlist=["Response"]).Response()
+    items_response = __import__("api.products", fromlist=["get_products"]).get_products(
+        request=SimpleNamespace(state=SimpleNamespace(current_user=other_owner)),
+        response=response,
+        page=1,
+        page_size=20,
+        search=None,
+        shop_display_id=hidden_shop.display_id,
+        track_shop_view=False,
+        min_price=None,
+        max_price=None,
+        sort_by="newest",
+        view_count=False,
+        attribute_option_ids=[],
+        attribute_filters=[],
+        product_group_id=None,
+        session=session,
+    )
+
+    assert items_response.success is True
+    assert items_response.data.total_count == 0
+    assert len(items_response.data.items) == 0
     session.close()
 
 
