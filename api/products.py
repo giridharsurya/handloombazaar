@@ -161,6 +161,7 @@ class ProductAttributeItem(BaseModel):
 
 class ShopSummary(BaseModel):
     display_id: str
+    shop_slug: Optional[str] = None
     name: str
     shop_logo_url: str
     email: str
@@ -371,6 +372,7 @@ def _serialize_product_detail(session: Session, item: product, view_count: int =
         "view_count": view_count,
         "shop": {
             "display_id": shop_row.display_id,
+            "shop_slug": (shop_row.shop_slug or "").strip() or None,
             "name": shop_row.name,
             "shop_logo_url": shop_row.shop_logo_url,
             "email": shop_row.email,
