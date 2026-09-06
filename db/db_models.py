@@ -68,6 +68,7 @@ class shop(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     shop_slug: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     description: Mapped[str] = mapped_column(String(1000), nullable=True)
+    about_content: Mapped[str] = mapped_column(String(10000), nullable=True)
     year_established: Mapped[int] = mapped_column(Integer, nullable=False)
     address: Mapped[str] = mapped_column(String(500), nullable=False)
     city: Mapped[str] = mapped_column(String(120), nullable=True)

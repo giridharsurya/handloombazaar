@@ -29,6 +29,7 @@ class ShopStatusResponse(BaseModel):
 class ShopDetailResponse(ShopStatusResponse):
     shop_slug: str
     description: str | None
+    about_content: str | None
     email: str
     address: str
     city: str | None
@@ -71,6 +72,7 @@ class ShopUpdateRequest(BaseModel):
     email: EmailStr | None = None
     shop_slug: str | None = Field(default=None, min_length=3, max_length=100)
     description: str | None = Field(default=None, max_length=1000)
+    about_content: str | None = Field(default=None, max_length=10000)
     year_established: int | None = Field(default=None, ge=1800, le=2100)
     address: str | None = Field(default=None, min_length=3, max_length=500)
     city: str | None = Field(default=None, min_length=2, max_length=120)
@@ -92,6 +94,7 @@ def _build_shop_detail_response(selected_shop: shop) -> ShopDetailResponse:
         is_active=bool(selected_shop.is_active),
         shop_slug=valid_slug,
         description=getattr(selected_shop, "description", None),
+        about_content=getattr(selected_shop, "about_content", None),
         email=selected_shop.email,
         address=selected_shop.address,
         city=selected_shop.city,
@@ -237,6 +240,8 @@ def update_shop_details(
         selected_shop.shop_slug = normalized_slug
     if "description" in provided_fields:
         selected_shop.description = payload.description.strip() if payload.description else None
+    if "about_content" in provided_fields:
+        selected_shop.about_content = payload.about_content.strip() if payload.about_content else None
     if "year_established" in provided_fields:
         if payload.year_established is None:
             raise HTTPException(status_code=400, detail="Year established cannot be null")
