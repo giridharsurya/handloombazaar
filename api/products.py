@@ -341,7 +341,7 @@ def _serialize_product_detail(session: Session, item: product, view_count: int =
     images = (
         session.query(product_image)
         .filter(product_image.product_id == item.id)
-        .order_by(product_image.created_at.asc())
+        .order_by(product_image.primary_image.desc(), product_image.created_at.asc())
         .all()
     )
 
