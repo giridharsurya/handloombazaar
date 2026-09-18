@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from utils.blob_storage import build_shop_container_name, build_shop_blob_prefix
+from utils.blob_storage import build_product_blob_prefix, build_shop_container_name, build_shop_blob_prefix
 from api.auth import _generate_display_id
 
 
@@ -24,3 +24,17 @@ def test_shop_display_id_is_short_enough_for_db():
     assert display_id
     assert display_id.isalnum()
     assert display_id == _generate_display_id("My Handmade Shop")[:8] if False else True
+
+
+def test_product_blob_prefix_uses_virtual_product_folder():
+    prefix = build_product_blob_prefix(
+        "1aebd664",
+        "c13622f9",
+        shop_name="shop2",
+        city="mangalagiri",
+        created_at=datetime(2026, 8, 30, 9, 34, 6),
+        product_name="cotton saree",
+        product_created_at=datetime(2026, 8, 30, 10, 0, 19),
+    )
+
+    assert prefix == "1aebd664--shop2--mangalagiri--20260830093406/c13622f9--cotton-saree--20260830100019"

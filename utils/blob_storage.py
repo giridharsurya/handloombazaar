@@ -163,6 +163,7 @@ def upload_product_image_to_blob(
     client = _get_blob_service_client()
     blob_client = client.get_blob_client(container=container_name, blob=blob_name)
     blob_client.upload_blob(data, overwrite=True)
+    blob_client.get_blob_properties()
     return blob_client.url
 
 

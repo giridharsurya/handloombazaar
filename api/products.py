@@ -1756,7 +1756,8 @@ async def update_product(
 
         existing_images = session.query(product_image).filter(product_image.product_id == target_product.id).all()
         for row in existing_images:
-            delete_blob_by_url(row.image_url)
+            if row.image_url not in final_urls:
+                delete_blob_by_url(row.image_url)
 
         session.query(product_image).filter(product_image.product_id == target_product.id).delete(
             synchronize_session=False
